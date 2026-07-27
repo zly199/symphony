@@ -1,0 +1,4 @@
+interface:
+  display_name: "Git MR Summary"
+  short_description: "Generate fixed-format Chinese MR description from branch diff"
+  default_prompt: "Generate MR description in fixed markdown format from current branch changes"

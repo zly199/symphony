@@ -1,0 +1,4 @@
+interface:
+  display_name: "Ticket Hotfix Cherry Pick"
+  short_description: "按票号原样回放hotfix，经完整性封印与语义验证后创建MR"
+  default_prompt: "Use $ticket-hotfix-cherry-pick to replay only the original kyuyo-backend MR commits, preserve the sealed branch unchanged during verification, and publish only after the integrity and semantic gates pass."

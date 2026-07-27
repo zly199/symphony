@@ -29,6 +29,8 @@ pushed directly from `upstream/main` to `origin/main`.
 | `main` | Clean mirror of `upstream/main` |
 | `custom` | Primary branch for the Backlog adapter and future personal changes |
 | `/Users/user/symphony` | The only local worktree, checked out on `custom` |
+| `workflows/kyuyo-backend/` | Versioned kyuyo ticket workflow, skills, evals, and memory procedures |
+| `/Users/user/IdeaProjects/kyuyo-backend` | Existing repository used by the Backlog workflow |
 
 Keep personal development on `custom`. Use short-lived feature branches from
 `custom` when a change needs isolated review.
@@ -87,3 +89,7 @@ git push
 
 The local Symphony dashboard remains available at
 `http://127.0.0.1:4000` while the Backlog LaunchAgent is running.
+
+The Backlog workflow uses `workspace.mode: existing`. It runs one agent directly in
+`/Users/user/IdeaProjects/kyuyo-backend`, follows the ticket identifier on the current branch, and
+preserves the repository when a ticket reaches a terminal state.

@@ -147,6 +147,13 @@ defmodule SymphonyElixir.Codex.AppServer do
     stop_port(port)
   end
 
+  @doc false
+  @spec validate_workspace_cwd_for_test(Path.t(), String.t() | nil) ::
+          {:ok, Path.t()} | {:error, term()}
+  def validate_workspace_cwd_for_test(workspace, worker_host) do
+    validate_workspace_cwd(workspace, worker_host)
+  end
+
   defp validate_workspace_cwd(workspace, nil) when is_binary(workspace) do
     expanded_workspace = Path.expand(workspace)
     expanded_root = Config.local_workspace_root()
@@ -157,6 +164,10 @@ defmodule SymphonyElixir.Codex.AppServer do
       canonical_root_prefix = canonical_root <> "/"
 
       cond do
+        canonical_workspace == canonical_root and
+            Config.settings!().workspace.mode == "existing" ->
+          {:ok, canonical_workspace}
+
         canonical_workspace == canonical_root ->
           {:error, {:invalid_workspace_cwd, :workspace_root, canonical_workspace}}
 
@@ -708,6 +719,28 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp maybe_handle_approval_request(
+         port,
+         "mcpServer/elicitation/request",
+         %{"id" => id, "params" => params} = payload,
+         payload_string,
+         on_message,
+         metadata,
+         _tool_executor,
+         auto_approve_requests
+       ) do
+    maybe_auto_approve_mcp_tool_call(
+      port,
+      id,
+      params,
+      payload,
+      payload_string,
+      on_message,
+      metadata,
+      auto_approve_requests
+    )
+  end
+
+  defp maybe_handle_approval_request(
          _port,
          _method,
          _payload,
@@ -832,6 +865,61 @@ defmodule SymphonyElixir.Codex.AppServer do
          false
        ),
        do: :input_required
+
+  defp maybe_auto_approve_mcp_tool_call(
+         port,
+         id,
+         params,
+         payload,
+         payload_string,
+         on_message,
+         metadata,
+         true
+       ) do
+    if mcp_tool_call_approval?(params) and empty_mcp_elicitation_schema?(params) do
+      send_message(port, %{
+        "id" => id,
+        "result" => %{"action" => "accept", "content" => %{}}
+      })
+
+      emit_message(
+        on_message,
+        :approval_auto_approved,
+        %{payload: payload, raw: payload_string, decision: "accept"},
+        metadata
+      )
+
+      :approved
+    else
+      :input_required
+    end
+  end
+
+  defp maybe_auto_approve_mcp_tool_call(
+         _port,
+         _id,
+         _params,
+         _payload,
+         _payload_string,
+         _on_message,
+         _metadata,
+         false
+       ),
+       do: :input_required
+
+  defp mcp_tool_call_approval?(%{"_meta" => %{"codex_approval_kind" => "mcp_tool_call"}}),
+    do: true
+
+  defp mcp_tool_call_approval?(_params), do: false
+
+  defp empty_mcp_elicitation_schema?(%{
+         "requestedSchema" => %{"type" => "object", "properties" => properties} = schema
+       })
+       when is_map(properties) do
+    map_size(properties) == 0 and Map.get(schema, "required", []) == []
+  end
+
+  defp empty_mcp_elicitation_schema?(_params), do: false
 
   defp tool_request_user_input_approval_answers(%{"questions" => questions}) when is_list(questions) do
     answers =

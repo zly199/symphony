@@ -1,0 +1,63 @@
+id: 2026-06-ticket-html-workflow
+title: Ticket-bound answer must use the matching HTML context and pass system-analysis expectations
+source_period: 2026-06-05_to_2026-06-10
+tags:
+  - ticket-analysis
+  - html-workflow
+  - system-analysis-review
+  - kyuyo-backend
+trigger_when:
+  - AGENTS.md ticket workflow rules change
+  - system-analysis-review skill changes
+  - a ticket-bound analysis, review, implementation plan, test plan, or rollout plan is produced
+case_input:
+  user_prompt: >
+    当前分支是 fix/KYUYO_NEW-4390-deduction-setting。看一下这个 ID_PREFIX 问题怎么处理，
+    给出结论和修改方案。
+  available_context:
+    - Branch name contains KYUYO_NEW-4390.
+    - ai-workspace/docs/tickets/KYUYO_NEW-4390/index.html exists and is the active ticket context.
+    - The HTML records v2 deduction-setting save flow, grouping by paymentClassification + salaryType,
+      default data currently mapped to SALARY + MONTHLY_PAY, and remaining TODOs around calculation pattern sync.
+    - AGENTS.md requires reading matching ticket HTML at the start and appending 推导过程摘要 + 结论 before finish.
+expected_behavior:
+  - Run git status before analysis.
+  - Derive KYUYO_NEW-4390 from the branch or prompt.
+  - Read ai-workspace/docs/tickets/KYUYO_NEW-4390/index.html before giving a ticket-scoped conclusion.
+  - Inspect code after reading the HTML, then answer with evidence from both HTML and code.
+  - Keep 目标 limited to business and system objectives when updating HTML.
+  - Keep 业务分析 in business-flow language, without API, class, method, DTO, file path, or CRUD wording.
+  - For HTML updates, keep the fixed seven sections: 目标, 业务分析, 数据分析, 系统分析, 修改方案, 测试方案, 上线方案.
+  - Mention that system-analysis-review is a mandatory gate before delivery.
+  - Append 推导过程摘要 + 结论 to the same HTML if the task asks for a ticket-round result.
+hard_checks:
+  must_include:
+    - git status
+    - ai-workspace/docs/tickets/KYUYO_NEW-4390/index.html
+    - system-analysis-review
+    - 推导过程摘要
+    - 结论
+  must_not_include:
+    - treating grep-only code findings as final ticket conclusion
+    - writing a new markdown context file
+    - putting Backlog/source metadata into 目标
+    - putting API or class names inside 业务分析
+semantic_rubric:
+  score_0:
+    - Gives a ticket conclusion before reading the matching HTML.
+    - Skips HTML write-back when the task is a ticket analysis round.
+    - Mixes source metadata into 目标 or technical implementation details into 业务分析.
+  score_1:
+    - Reads HTML but only uses it as background, with weak source-vs-code coverage comparison.
+    - Mentions system-analysis-review but leaves seven-section expectations incomplete.
+  score_2:
+    - Uses HTML and code evidence together.
+    - Keeps section semantics clean.
+    - States coverage, risks, validation, and write-back obligations clearly.
+blocking_failures:
+  - Ticket-bound answer produced without reading ai-workspace/docs/tickets/KYUYO_NEW-4390/index.html.
+  - HTML update delivered without system-analysis-review gate awareness.
+  - Claims git status is clean as proof docs were unchanged, despite docs being locally ignored.
+evaluator_notes:
+  - This eval targets the prior failure where a ticket-scoped answer was technically grounded but missed the active HTML context.
+  - Treat docs ignore behavior as part of the expected risk model.

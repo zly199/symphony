@@ -34,6 +34,18 @@ defmodule SymphonyElixir.AppServerTest do
 
       assert {:error, {:invalid_workspace_cwd, :outside_workspace_root, _path, _root}} =
                AppServer.run(outside_workspace, "guard", issue)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_mode: "existing",
+        workspace_root: workspace_root,
+        max_concurrent_agents: 1
+      )
+
+      assert {:ok, canonical_workspace_root} =
+               SymphonyElixir.PathSafety.canonicalize(workspace_root)
+
+      assert {:ok, ^canonical_workspace_root} =
+               AppServer.validate_workspace_cwd_for_test(workspace_root, nil)
     after
       File.rm_rf(test_root)
     end
@@ -411,6 +423,80 @@ defmodule SymphonyElixir.AppServerTest do
                AppServer.run(workspace, "Needs MCP input", issue)
 
       assert payload["method"] == "mcpServer/elicitation/request"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server auto-approves empty MCP tool-call elicitations under never policy" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-mcp-auto-approval-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-188A")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-188a"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-188a"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":4,"method":"mcpServer/elicitation/request","params":{"_meta":{"codex_approval_kind":"mcp_tool_call"},"requestedSchema":{"type":"object","properties":{}}}}'
+            ;;
+          5)
+            case "$line" in
+              *'"action":"accept"'*'"content":{}'*)
+                printf '%s\\n' '{"method":"turn/completed","params":{"turn":{"id":"turn-188a"}}}'
+                ;;
+              *)
+                exit 1
+                ;;
+            esac
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_approval_policy: "never"
+      )
+
+      issue = %Issue{
+        id: "issue-mcp-auto-approval",
+        identifier: "MT-188A",
+        title: "MCP tool approval",
+        description: "Approve an MCP tool call in unattended mode",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-188A",
+        labels: ["backend"]
+      }
+
+      assert {:ok, %{result: :turn_completed}} =
+               AppServer.run(workspace, "Approve MCP tool call", issue)
     after
       File.rm_rf(test_root)
     end

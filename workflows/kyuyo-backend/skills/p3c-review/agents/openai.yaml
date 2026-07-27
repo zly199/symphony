@@ -1,0 +1,4 @@
+interface:
+  display_name: "P3C Review"
+  short_description: "Run Alibaba P3C Java code review and summarize findings."
+  default_prompt: "Use Alibaba P3C rules to review the current Java changes and report high-risk violations first."

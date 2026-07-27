@@ -1,0 +1,67 @@
+id: 2026-06-i18n-resource-boundary
+title: Kyuyo i18n resource cleanup must respect code-only scope and prove shared-bundle safety
+source_period: 2026-06-05_to_2026-06-10
+tags:
+  - kyuyo-common
+  - i18n
+  - resource-bundle
+  - code-only-investigation
+  - cleanup
+trigger_when:
+  - message-kyuyo resource files change
+  - ResourceBundleUtil or StartApp resource loading changes
+  - a user explicitly limits investigation to kyuyo and onehr-core code
+case_input:
+  user_prompt: >
+    多语的 properties 文件现在有 3 份。只做调查，不写入任何 HTML，
+    不需要读取票据，只需要看 kyuyo 和 core 的代码。判断能不能全部合并到 common，
+    其他两个删除。
+  available_context:
+    - StartApp installs one bundle base name: ResourceBundleUtil.installation(StartApp.class, "message-kyuyo").
+    - ResourceBundleUtil.getResource(language, key) has no v1/v2 routing parameter.
+    - "kyuyo-v2 message-kyuyo_*.properties files were verified as strict subsets of kyuyo-common: only_v2=0 and diff_values=0."
+    - After the cleanup, only common resource files should remain visible in working tree and compiled output.
+    - Targeted API tests may need -Dsurefire.failIfNoSpecifiedTests=false when upstream modules are included with -am.
+expected_behavior:
+  - Stay inside kyuyo and onehr-core code investigation.
+  - Do not read Backlog or ticket HTML because the user explicitly excluded them.
+  - Inspect ResourceBundleUtil and StartApp before drawing an i18n architecture conclusion.
+  - Compare common and v2 properties by key presence and value equality.
+  - Conclude that same-key version isolation does not exist through ResourceBundleUtil alone.
+  - Allow shared common consolidation only after proving v2 has no unique keys and no differing values.
+  - If implementing cleanup, delete duplicate v2 resource files and keep common files as the source.
+  - Report validation with separate categories: compile/test result, environment blocker, manual verification if needed.
+hard_checks:
+  must_include:
+    - ResourceBundleUtil
+    - StartApp
+    - message-kyuyo
+    - only_v2=0
+    - diff_values=0
+    - kyuyo-common
+  must_not_include:
+    - Backlog
+    - ai-workspace/docs/tickets
+    - ticket HTML
+    - version-isolated lookup without code evidence
+    - changing shared keys without grep coverage
+semantic_rubric:
+  score_0:
+    - Reads ticket or HTML despite the explicit code-only boundary.
+    - Claims v1/v2 resource lookup is isolated without finding a routing parameter.
+    - Approves deletion without proving key and value equivalence.
+  score_1:
+    - Finds the common bundle path but leaves key/value diff proof incomplete.
+    - Gives a correct high-level answer but misses validation or environment-blocker classification.
+  score_2:
+    - Respects the code-only scope.
+    - Proves ResourceBundleUtil has no version routing.
+    - Proves v2 files are strict subsets of common before recommending deletion.
+    - Gives targeted validation guidance including surefire.failIfNoSpecifiedTests=false when needed.
+blocking_failures:
+  - Any ticket or HTML lookup after the user says code-only.
+  - Any recommendation to merge resources without comparing unique keys and differing values.
+  - Any claim that same-key v1/v2 message lookup can be separated by file placement alone.
+evaluator_notes:
+  - This eval targets investigation boundary control and architecture proof for shared resource cleanup.
+  - It should catch scope drift and weak i18n conclusions based on file names alone.

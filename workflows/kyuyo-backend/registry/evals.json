@@ -1,0 +1,28 @@
+{
+  "runner": {
+    "path": "workflows/kyuyo-backend/evals/runners/run_evals.py",
+    "script": "workflows/kyuyo-backend/scripts/run-evals.sh"
+  },
+  "cases": [
+    {
+      "id": "2026-06-i18n-resource-boundary",
+      "path": "workflows/kyuyo-backend/evals/cases/2026-06-i18n-resource-boundary.yaml"
+    },
+    {
+      "id": "2026-06-reply-language-chinese",
+      "path": "workflows/kyuyo-backend/evals/cases/2026-06-reply-language-chinese.yaml"
+    },
+    {
+      "id": "2026-06-ticket-html-workflow",
+      "path": "workflows/kyuyo-backend/evals/cases/2026-06-ticket-html-workflow.yaml"
+    },
+    {
+      "id": "2026-06-v2-deduction-save-scope",
+      "path": "workflows/kyuyo-backend/evals/cases/2026-06-v2-deduction-save-scope.yaml"
+    },
+    {
+      "id": "2026-07-hotfix-cp-branch-integrity",
+      "path": "workflows/kyuyo-backend/evals/cases/2026-07-hotfix-cp-branch-integrity.yaml"
+    }
+  ]
+}

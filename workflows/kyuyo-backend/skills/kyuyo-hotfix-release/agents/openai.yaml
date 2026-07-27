@@ -1,0 +1,5 @@
+interface:
+  display_name: "Kyuyo Hotfix Release"
+  short_description: "Create Kyuyo hotfix branch and verify deploy."
+  default_prompt: "Create a kyuyo-backend hotfix branch from versions API build hash, wait for pipeline, and verify deployed build/branch in target environment."
+  response_language: "Chinese (Simplified)"

@@ -150,6 +150,14 @@ Notes:
 - `tracker.required_labels` is optional. When set, an issue must have every
   configured label to dispatch or continue running. Label matching ignores
   case and surrounding whitespace. A blank configured label matches no issue.
+- `workspace.mode` defaults to `per_issue`, which creates
+  `<workspace.root>/<workspace_key>`. The optional `existing` mode runs Codex directly in
+  `workspace.root`, requires `agent.max_concurrent_agents: 1`, rejects SSH workers and
+  `hooks.after_create`, and preserves that directory during terminal cleanup.
+- Existing-workspace dispatch follows the ticket identifier in the current Git branch. A clean
+  `main`, `master`, `develop`, or `development` branch can accept a new ticket. A ticket branch
+  dispatches its matching active ticket. When that ticket leaves the active set, a clean branch
+  can accept the next ticket while a branch with local changes pauses dispatch.
 - Safer Codex defaults are used when policy fields are omitted:
   - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
   - `codex.thread_sandbox` defaults to `workspace-write`

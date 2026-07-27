@@ -9,10 +9,80 @@ defmodule SymphonyElixir.Workspace do
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
 
   @type worker_host :: String.t() | nil
+  @default_repository_branches ["main", "master", "develop", "development"]
 
   @spec create_for_issue(map() | String.t() | nil, worker_host()) ::
           {:ok, Path.t()} | {:error, term()}
   def create_for_issue(issue_or_identifier, worker_host \\ nil) do
+    case Config.settings!().workspace.mode do
+      "existing" -> use_existing_workspace(worker_host)
+      _ -> create_per_issue_workspace(issue_or_identifier, worker_host)
+    end
+  end
+
+  @spec dispatch_candidates([map()]) :: [map()]
+  def dispatch_candidates(issues) when is_list(issues) do
+    case Config.settings!().workspace.mode do
+      "existing" -> existing_workspace_dispatch_candidates(issues)
+      _ -> issues
+    end
+  end
+
+  defp existing_workspace_dispatch_candidates(issues) do
+    workspace = Config.local_workspace_root()
+
+    with {branch, 0} <-
+           System.cmd("git", ["-C", workspace, "branch", "--show-current"], stderr_to_stdout: true),
+         branch <- String.trim(branch),
+         {status, 0} <-
+           System.cmd("git", ["-C", workspace, "status", "--porcelain"], stderr_to_stdout: true) do
+      select_candidates_for_existing_branch(issues, branch, String.trim(status))
+    else
+      {_output, status} ->
+        Logger.warning("Existing workspace is not ready for dispatch path=#{workspace} git_status=#{status}")
+
+        []
+    end
+  end
+
+  defp select_candidates_for_existing_branch(issues, branch, status) do
+    case Regex.run(~r/[A-Z][A-Z0-9_]*-\d+/, branch) do
+      [identifier] ->
+        matching_issues =
+          Enum.filter(issues, fn
+            %{identifier: issue_identifier} when is_binary(issue_identifier) ->
+              String.upcase(issue_identifier) == String.upcase(identifier)
+
+            _ ->
+              false
+          end)
+
+        select_ticket_branch_candidates(issues, matching_issues, branch, status)
+
+      nil when branch in @default_repository_branches and status == "" ->
+        issues
+
+      nil ->
+        Logger.info("Existing workspace is occupied by branch=#{branch} dirty=#{status != ""}; skipping dispatch")
+
+        []
+    end
+  end
+
+  defp select_ticket_branch_candidates(issues, [], branch, "") do
+    Logger.info("Existing workspace is clean and its ticket branch is no longer active branch=#{branch}; allowing the next ticket")
+    issues
+  end
+
+  defp select_ticket_branch_candidates(_issues, [], branch, _status) do
+    Logger.info("Existing workspace has local changes on a non-active ticket branch=#{branch}; skipping dispatch")
+    []
+  end
+
+  defp select_ticket_branch_candidates(_issues, matching_issues, _branch, _status),
+    do: matching_issues
+
+  defp create_per_issue_workspace(issue_or_identifier, worker_host) do
     issue_context = issue_context(issue_or_identifier)
 
     try do
@@ -33,8 +103,28 @@ defmodule SymphonyElixir.Workspace do
     rescue
       error in [ArgumentError, ErlangError, File.Error] ->
         Logger.error("Workspace creation failed #{issue_log_context(issue_context)} worker_host=#{worker_host_for_log(worker_host)} error=#{Exception.message(error)}")
+
         {:error, error}
     end
+  end
+
+  defp use_existing_workspace(nil) do
+    workspace = Config.local_workspace_root()
+
+    with {:ok, canonical_workspace} <- PathSafety.canonicalize(workspace),
+         true <- File.dir?(canonical_workspace) do
+      {:ok, canonical_workspace}
+    else
+      false ->
+        {:error, {:existing_workspace_missing, Path.expand(workspace)}}
+
+      {:error, {:path_canonicalize_failed, path, reason}} ->
+        {:error, {:workspace_path_unreadable, path, reason}}
+    end
+  end
+
+  defp use_existing_workspace(worker_host) when is_binary(worker_host) do
+    {:error, {:existing_workspace_unsupported_worker, worker_host}}
   end
 
   defp ensure_workspace(workspace, nil) do
@@ -95,37 +185,55 @@ defmodule SymphonyElixir.Workspace do
 
   @spec remove(Path.t(), worker_host()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
   def remove(workspace, nil) do
-    case File.exists?(workspace) do
-      true ->
-        case validate_workspace_path(workspace, nil) do
-          :ok ->
-            remove_local_workspace(workspace)
-
-          {:error, reason} ->
-            {:error, reason, ""}
-        end
-
-      false ->
-        File.rm_rf(workspace)
+    if existing_workspace_mode?() do
+      {:ok, []}
+    else
+      remove_local_workspace_if_safe(workspace)
     end
   end
 
   def remove(workspace, worker_host) when is_binary(worker_host) do
-    maybe_run_before_remove_hook(workspace, worker_host)
+    if existing_workspace_mode?() do
+      {:ok, []}
+    else
+      maybe_run_before_remove_hook(workspace, worker_host)
 
-    script =
-      [
-        remote_shell_assign("workspace", workspace),
-        "rm -rf \"$workspace\""
-      ]
-      |> Enum.join("\n")
+      script =
+        [
+          remote_shell_assign("workspace", workspace),
+          "rm -rf \"$workspace\""
+        ]
+        |> Enum.join("\n")
 
-    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
-      {:ok, {_output, 0}} ->
-        {:ok, []}
+      case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+        {:ok, {_output, 0}} ->
+          {:ok, []}
 
-      {:ok, {output, status}} ->
-        {:error, {:workspace_remove_failed, worker_host, status, output}, ""}
+        {:ok, {output, status}} ->
+          {:error, {:workspace_remove_failed, worker_host, status, output}, ""}
+
+        {:error, reason} ->
+          {:error, reason, ""}
+      end
+    end
+  end
+
+  defp existing_workspace_mode? do
+    Config.settings!().workspace.mode == "existing"
+  end
+
+  defp remove_local_workspace_if_safe(workspace) do
+    if File.exists?(workspace) do
+      remove_validated_local_workspace(workspace)
+    else
+      File.rm_rf(workspace)
+    end
+  end
+
+  defp remove_validated_local_workspace(workspace) do
+    case validate_workspace_path(workspace, nil) do
+      :ok ->
+        remove_local_workspace(workspace)
 
       {:error, reason} ->
         {:error, reason, ""}
@@ -133,27 +241,38 @@ defmodule SymphonyElixir.Workspace do
   end
 
   @doc false
-  @spec remove_recorded(Path.t(), worker_host()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
+  @spec remove_recorded(Path.t(), worker_host()) ::
+          {:ok, [String.t()]} | {:error, term(), String.t()}
   def remove_recorded(workspace, nil) when is_binary(workspace) do
-    if Path.type(workspace) == :absolute do
-      case validate_recorded_workspace_path(workspace) do
-        :ok ->
-          remove_local_workspace(workspace)
+    cond do
+      existing_workspace_mode?() ->
+        {:ok, []}
 
-        {:error, reason} ->
-          {:error, reason, ""}
-      end
-    else
-      {:error, {:workspace_path_unreadable, workspace, :not_absolute}, ""}
+      Path.type(workspace) != :absolute ->
+        {:error, {:workspace_path_unreadable, workspace, :not_absolute}, ""}
+
+      true ->
+        remove_validated_recorded_workspace(workspace)
     end
   end
 
-  def remove_recorded(workspace, worker_host) when is_binary(workspace) and is_binary(worker_host) do
+  def remove_recorded(workspace, worker_host)
+      when is_binary(workspace) and is_binary(worker_host) do
     remove(workspace, worker_host)
   end
 
   def remove_recorded(workspace, _worker_host) do
     {:error, {:workspace_path_unreadable, workspace, :invalid}, ""}
+  end
+
+  defp remove_validated_recorded_workspace(workspace) do
+    case validate_recorded_workspace_path(workspace) do
+      :ok ->
+        remove_local_workspace(workspace)
+
+      {:error, reason} ->
+        {:error, reason, ""}
+    end
   end
 
   defp remove_local_workspace(workspace) do
@@ -190,7 +309,8 @@ defmodule SymphonyElixir.Workspace do
     :ok
   end
 
-  def remove_issue_workspaces(identifier, worker_host) when is_binary(identifier) and is_binary(worker_host) do
+  def remove_issue_workspaces(identifier, worker_host)
+      when is_binary(identifier) and is_binary(worker_host) do
     case workspace_path_for_issue(workspace_key(identifier), worker_host) do
       {:ok, workspace} -> remove(workspace, worker_host)
       {:error, _reason} -> :ok
@@ -218,7 +338,8 @@ defmodule SymphonyElixir.Workspace do
 
   @spec run_before_run_hook(Path.t(), map() | String.t() | nil, worker_host()) ::
           :ok | {:error, term()}
-  def run_before_run_hook(workspace, issue_or_identifier, worker_host \\ nil) when is_binary(workspace) do
+  def run_before_run_hook(workspace, issue_or_identifier, worker_host \\ nil)
+      when is_binary(workspace) do
     issue_context = issue_context(issue_or_identifier)
     hooks = Config.settings!().hooks
 
@@ -232,7 +353,8 @@ defmodule SymphonyElixir.Workspace do
   end
 
   @spec run_after_run_hook(Path.t(), map() | String.t() | nil, worker_host()) :: :ok
-  def run_after_run_hook(workspace, issue_or_identifier, worker_host \\ nil) when is_binary(workspace) do
+  def run_after_run_hook(workspace, issue_or_identifier, worker_host \\ nil)
+      when is_binary(workspace) do
     issue_context = issue_context(issue_or_identifier)
     hooks = Config.settings!().hooks
 
@@ -252,7 +374,8 @@ defmodule SymphonyElixir.Workspace do
     |> PathSafety.canonicalize()
   end
 
-  defp workspace_path_for_issue(safe_id, worker_host) when is_binary(safe_id) and is_binary(worker_host) do
+  defp workspace_path_for_issue(safe_id, worker_host)
+       when is_binary(safe_id) and is_binary(worker_host) do
     {:ok, Path.join(Config.settings!().workspace.root, safe_id)}
   end
 
@@ -317,7 +440,8 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp cleanup_failed_new_workspace(workspace, true, worker_host) when is_binary(worker_host) do
-    script = [remote_shell_assign("workspace", workspace), "rm -rf \"$workspace\""] |> Enum.join("\n")
+    script =
+      [remote_shell_assign("workspace", workspace), "rm -rf \"$workspace\""] |> Enum.join("\n")
 
     case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
       {:ok, {_output, 0}} ->
@@ -417,12 +541,17 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp run_hook(command, workspace, issue_context, hook_name, worker_host) when is_binary(worker_host) do
+  defp run_hook(command, workspace, issue_context, hook_name, worker_host)
+       when is_binary(worker_host) do
     timeout_ms = Config.settings!().hooks.timeout_ms
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host}")
 
-    case run_remote_command(worker_host, "cd #{shell_escape(workspace)} && #{command}", timeout_ms) do
+    case run_remote_command(
+           worker_host,
+           "cd #{shell_escape(workspace)} && #{command}",
+           timeout_ms
+         ) do
       {:ok, cmd_result} ->
         handle_hook_command_result(cmd_result, workspace, issue_context, hook_name)
 
@@ -545,7 +674,8 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp run_remote_command(worker_host, script, timeout_ms)
-       when is_binary(worker_host) and is_binary(script) and is_integer(timeout_ms) and timeout_ms > 0 do
+       when is_binary(worker_host) and is_binary(script) and is_integer(timeout_ms) and
+              timeout_ms > 0 do
     task =
       Task.async(fn ->
         SSH.run(worker_host, script, stderr_to_stdout: true)

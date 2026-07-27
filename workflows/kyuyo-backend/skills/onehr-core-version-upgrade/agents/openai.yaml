@@ -1,0 +1,4 @@
+interface:
+  display_name: "Core Version Upgrade"
+  short_description: "Sync master, bump onehr-core, push feat branch."
+  default_prompt: "Upgrade onehr-core.version by syncing master, creating a sanitized feat branch, updating pom.xml, committing, and pushing."

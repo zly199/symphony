@@ -1,0 +1,28 @@
+{
+  "entries": [
+    {
+      "name": "docs-index",
+      "path": "ai-workspace/docs/index.html"
+    },
+    {
+      "name": "tickets",
+      "path": "ai-workspace/docs/tickets"
+    },
+    {
+      "name": "hotfix",
+      "path": "ai-workspace/docs/hotfix"
+    },
+    {
+      "name": "tech",
+      "path": "ai-workspace/docs/tech"
+    },
+    {
+      "name": "testing",
+      "path": "ai-workspace/docs/testing"
+    },
+    {
+      "name": "other",
+      "path": "ai-workspace/docs/other"
+    }
+  ]
+}

@@ -8,11 +8,12 @@ import re
 
 
 INSTALL_ROOT = "/Users/user/symphony"
-BINARY_PATH = f"{INSTALL_ROOT}/symphony-backlog-macos_arm64"
+ELIXIR_ROOT = f"{INSTALL_ROOT}/elixir"
 WORKFLOW_PATH = f"{INSTALL_ROOT}/WORKFLOW.backlog.md"
 RUNTIME_PATH = f"{INSTALL_ROOT}/runtime"
 LOGS_PATH = f"{INSTALL_ROOT}/var"
 OPENCODE_CONFIG = "/Users/user/.config/opencode/opencode.jsonc"
+MISE_PATH = "/opt/homebrew/bin/mise"
 ACKNOWLEDGEMENT = "--i-understand-that-this-will-be-running-without-the-usual-guardrails"
 
 
@@ -49,15 +50,26 @@ def main() -> None:
     environment = os.environ.copy()
     environment["BACKLOG_API_KEY"] = backlog_api_key()
     environment["SYMPHONY_INSTALL_DIR"] = RUNTIME_PATH
+    environment["MIX_ENV"] = "prod"
     environment["PATH"] = (
         "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
     )
     environment.setdefault("LANG", "en_US.UTF-8")
 
+    os.chdir(ELIXIR_ROOT)
     os.execve(
-        BINARY_PATH,
+        MISE_PATH,
         [
-            BINARY_PATH,
+            MISE_PATH,
+            "exec",
+            "--",
+            "mix",
+            "run",
+            "--no-start",
+            "--no-compile",
+            "-e",
+            "SymphonyElixir.CLI.main(System.argv())",
+            "--",
             ACKNOWLEDGEMENT,
             "--logs-root",
             LOGS_PATH,

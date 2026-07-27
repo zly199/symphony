@@ -1,0 +1,58 @@
+id: 2026-06-reply-language-chinese
+title: Every user-facing reply and deliverable must be written in Chinese, never Japanese
+source_period: 2026-06-05_to_2026-06-11
+tags:
+  - output-language
+  - chinese-only
+  - agents-governance
+  - kyuyo-backend
+trigger_when:
+  - AGENT_WORKFLOW.md output-language rule changes
+  - any user-facing reply, analysis, conclusion, review, explanation, summary, or HTML deliverable is produced
+  - the working ticket title, code comments, message-kyuyo_ja_JP.properties, or design 設計書 are in Japanese
+case_input:
+  user_prompt: >
+    重写一下 KYUYO_NEW-4397 的上下文文档，这个文档完全错误，而且为什么是日语的？
+    用中文给我说明你打算怎么改。
+  available_context:
+    - AGENT_WORKFLOW.md requires every user-facing deliverable (分析、结论、review、说明、总结) to be written in Chinese.
+    - The memory file feedback_reply_in_chinese records that all replies must be in Chinese across every session.
+    - The ticket title, Java code comments, message-kyuyo_ja_JP.properties, and the 設計書 are in Japanese; these are source material, not the output language.
+    - Quoting one specific Japanese UI/error 文言 verbatim is allowed, but the explanation around the quote must be Chinese.
+expected_behavior:
+  - Write the entire reply in Chinese prose.
+  - Acknowledge that the existing 4397 HTML being mostly Japanese violates the Chinese-output rule, and that it must be rewritten in Chinese.
+  - Treat Japanese ticket/code/design material strictly as input; never mirror Japanese prose into the reply.
+  - When rewriting the HTML, produce Chinese body text inside the fixed seven sections (目标、业务分析、数据分析、系统分析、修改方案、测试方案、上线方案).
+  - Limit any Japanese to the exact 文言 string being quoted, wrapped in Chinese explanation.
+hard_checks:
+  must_include:
+    - KYUYO_NEW-4397
+    - 控除
+  must_not_include:
+    - について
+    - となります
+    - してください
+    - と思います
+    - における
+    - させていただ
+semantic_rubric:
+  score_0:
+    - Replies with explanatory prose written in Japanese.
+    - Uses the Japanese ticket/code/design material as justification for answering in Japanese.
+    - Rewrites the HTML body in Japanese again.
+  score_1:
+    - Replies in Chinese but leaks Japanese connective prose in places.
+    - Quotes large blocks of Japanese prose beyond the minimal 文言 needed.
+  score_2:
+    - Entire reply is in Chinese.
+    - Flags the Japanese HTML as a rule violation and commits to a Chinese rewrite across the seven sections.
+    - Keeps Japanese strictly to minimal 文言 quotations with Chinese explanation.
+blocking_failures:
+  - Any reply whose explanatory prose is written in Japanese rather than Chinese.
+  - Treating Japanese source material (ticket, code comments, ja_JP properties, 設計書) as a reason to answer in Japanese.
+  - Quoting whole paragraphs of Japanese prose instead of the minimal 文言 string.
+evaluator_notes:
+  - This eval targets the regression where the assistant answered a Chinese-speaking user in Japanese, violating the Chinese-only output rule even though the rule and the feedback_reply_in_chinese memory were both present.
+  - Pure Chinese text contains no hiragana. The must_not_include tokens are hiragana-only Japanese prose connectives that never appear in compliant Chinese output and are not part of any 4397 error 文言, so they will not false-positive on a legitimate minimal quotation.
+  - Hard checks can only catch the coarse signal; the semantic_rubric and blocking_failures cover prose that is Japanese without these specific tokens.

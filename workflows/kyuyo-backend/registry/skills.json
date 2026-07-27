@@ -1,0 +1,64 @@
+{
+  "skills": [
+    {
+      "name": "backlog-api",
+      "path": "workflows/kyuyo-backend/skills/backlog-api",
+      "entry": "workflows/kyuyo-backend/skills/backlog-api/SKILL.md"
+    },
+    {
+      "name": "doc",
+      "path": "workflows/kyuyo-backend/skills/doc",
+      "entry": "workflows/kyuyo-backend/skills/doc/SKILL.md"
+    },
+    {
+      "name": "excel-to-html",
+      "path": "workflows/kyuyo-backend/skills/excel-to-html",
+      "entry": "workflows/kyuyo-backend/skills/excel-to-html/SKILL.md"
+    },
+    {
+      "name": "git-mr-summary",
+      "path": "workflows/kyuyo-backend/skills/git-mr-summary",
+      "entry": "workflows/kyuyo-backend/skills/git-mr-summary/SKILL.md"
+    },
+    {
+      "name": "kyuyo-hotfix-release",
+      "path": "workflows/kyuyo-backend/skills/kyuyo-hotfix-release",
+      "entry": "workflows/kyuyo-backend/skills/kyuyo-hotfix-release/SKILL.md"
+    },
+    {
+      "name": "onehr-core-version-upgrade",
+      "path": "workflows/kyuyo-backend/skills/onehr-core-version-upgrade",
+      "entry": "workflows/kyuyo-backend/skills/onehr-core-version-upgrade/SKILL.md"
+    },
+    {
+      "name": "p3c-review",
+      "path": "workflows/kyuyo-backend/skills/p3c-review",
+      "entry": "workflows/kyuyo-backend/skills/p3c-review/SKILL.md"
+    },
+    {
+      "name": "pdf",
+      "path": "workflows/kyuyo-backend/skills/pdf",
+      "entry": "workflows/kyuyo-backend/skills/pdf/SKILL.md"
+    },
+    {
+      "name": "pptx",
+      "path": "workflows/kyuyo-backend/skills/pptx",
+      "entry": "workflows/kyuyo-backend/skills/pptx/SKILL.md"
+    },
+    {
+      "name": "system-analysis-review",
+      "path": "workflows/kyuyo-backend/skills/system-analysis-review",
+      "entry": "workflows/kyuyo-backend/skills/system-analysis-review/SKILL.md"
+    },
+    {
+      "name": "ticket-hotfix-cherry-pick",
+      "path": "workflows/kyuyo-backend/skills/ticket-hotfix-cherry-pick",
+      "entry": "workflows/kyuyo-backend/skills/ticket-hotfix-cherry-pick/SKILL.md"
+    },
+    {
+      "name": "weekly-retro",
+      "path": "workflows/kyuyo-backend/skills/weekly-retro",
+      "entry": "workflows/kyuyo-backend/skills/weekly-retro/SKILL.md"
+    }
+  ]
+}

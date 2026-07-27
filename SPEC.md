@@ -614,6 +614,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `tracker.active_states`: list of provider-native state names, adapter-defined default
 - `tracker.terminal_states`: list of provider-native state names, adapter-defined default
 - `polling.interval_ms`: integer, default `30000`
+- `workspace.mode`: `per_issue` or `existing`, default `per_issue`
 - `workspace.root`: path resolved to absolute, default `<system-temp>/symphony_workspaces`
 - `hooks.after_create`: shell script or null
 - `hooks.before_run`: shell script or null
@@ -856,9 +857,10 @@ Workspace root:
 
 - `workspace.root` (normalized absolute path)
 
-Per-issue workspace path:
+Workspace path:
 
-- `<workspace.root>/<workspace_key>`
+- `workspace.mode=per_issue`: `<workspace.root>/<workspace_key>`
+- `workspace.mode=existing`: `<workspace.root>`
 
 Workspace persistence:
 
@@ -871,6 +873,8 @@ Input: `issue.identifier`
 
 Algorithm summary:
 
+For `workspace.mode=per_issue`:
+
 1. Derive `workspace_key` using Section 4.2, including the stable original-identifier hash when
    sanitization changes the identifier.
 2. Compute workspace path under workspace root.
@@ -878,6 +882,14 @@ Algorithm summary:
 4. Mark `created_now=true` only if the directory was created during this call; otherwise
    `created_now=false`.
 5. If `created_now=true`, run `after_create` hook if configured.
+
+For the optional high-trust `workspace.mode=existing` extension:
+
+1. Require `workspace.root` to exist.
+2. Use its canonical path directly as the coding-agent cwd.
+3. Require a single concurrent agent and local execution.
+4. Reject `after_create`.
+5. Preserve the configured directory during all workspace cleanup paths.
 
 Notes:
 
@@ -929,12 +941,13 @@ Failure semantics:
 
 This is the most important portability constraint.
 
-Invariant 1: Run the coding agent only in the per-issue workspace path.
+Invariant 1: Run the coding agent only in the selected workspace path.
 
 - Before launching the coding-agent subprocess, validate:
   - `cwd == workspace_path`
 
-Invariant 2: Workspace path MUST stay inside workspace root.
+Invariant 2: Workspace path MUST stay inside workspace root, or equal the root when the explicit
+`existing` extension is enabled.
 
 - Normalize both paths to absolute.
 - Require `workspace_path` to have `workspace_root` as a prefix directory.
@@ -1734,9 +1747,11 @@ Operational safety requirements:
 
 Mandatory:
 
-- Workspace path MUST remain under configured workspace root.
-- Coding-agent cwd MUST be the per-issue workspace path for the current run.
-- Workspace directory names MUST use sanitized identifiers.
+- Workspace path MUST remain under configured workspace root. The explicit `existing` extension
+  MAY use the root itself.
+- Coding-agent cwd MUST be the selected workspace path for the current run.
+- Per-issue workspace directory names MUST use sanitized identifiers.
+- Existing workspace mode MUST disable destructive workspace cleanup.
 
 RECOMMENDED additional hardening for ports:
 

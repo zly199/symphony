@@ -40,6 +40,148 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "existing workspace mode uses the configured directory and preserves it during cleanup" do
+    existing_workspace =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-existing-workspace-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      File.mkdir_p!(existing_workspace)
+      marker = Path.join(existing_workspace, "keep.txt")
+      File.write!(marker, "keep\n")
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_mode: "existing",
+        workspace_root: existing_workspace,
+        max_concurrent_agents: 1
+      )
+
+      assert :ok = Config.validate!()
+
+      assert {:ok, canonical_workspace} =
+               SymphonyElixir.PathSafety.canonicalize(existing_workspace)
+
+      assert {:ok, ^canonical_workspace} = Workspace.create_for_issue("MT-EXISTING")
+
+      assert :ok = Workspace.remove_issue_workspaces("MT-EXISTING")
+      assert {:ok, []} = Workspace.remove_recorded(canonical_workspace, nil)
+      assert File.read!(marker) == "keep\n"
+    after
+      File.rm_rf(existing_workspace)
+    end
+  end
+
+  test "existing workspace mode rejects unsafe runtime combinations" do
+    existing_workspace =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-existing-workspace-config-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      File.mkdir_p!(existing_workspace)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_mode: "existing",
+        workspace_root: existing_workspace,
+        max_concurrent_agents: 2
+      )
+
+      assert {:error, :existing_workspace_requires_single_agent} = Config.validate!()
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_mode: "existing",
+        workspace_root: existing_workspace,
+        max_concurrent_agents: 1,
+        hook_after_create: "git clone example.invalid ."
+      )
+
+      assert {:error, :existing_workspace_does_not_support_after_create} = Config.validate!()
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_mode: "existing",
+        workspace_root: existing_workspace,
+        max_concurrent_agents: 1,
+        worker_ssh_hosts: ["worker-01"]
+      )
+
+      assert {:error, :existing_workspace_does_not_support_ssh_workers} = Config.validate!()
+    after
+      File.rm_rf(existing_workspace)
+    end
+  end
+
+  test "existing workspace mode requires the configured directory to exist" do
+    missing_workspace =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-missing-existing-workspace-#{System.unique_integer([:positive])}"
+      )
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_mode: "existing",
+      workspace_root: missing_workspace,
+      max_concurrent_agents: 1
+    )
+
+    assert {:error, {:existing_workspace_missing, ^missing_workspace}} =
+             Workspace.create_for_issue("MT-MISSING")
+  end
+
+  test "existing workspace mode dispatches the ticket represented by the current branch" do
+    existing_workspace =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-existing-workspace-branch-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      File.mkdir_p!(existing_workspace)
+      assert {_output, 0} = System.cmd("git", ["-C", existing_workspace, "init", "-b", "master"])
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_mode: "existing",
+        workspace_root: existing_workspace,
+        max_concurrent_agents: 1
+      )
+
+      first_issue = %Issue{
+        id: "1",
+        identifier: "KYUYO_NEW-100",
+        title: "first",
+        state: "In Progress"
+      }
+
+      current_issue = %Issue{
+        id: "2",
+        identifier: "KYUYO_NEW-200",
+        title: "current",
+        state: "In Progress"
+      }
+
+      assert Workspace.dispatch_candidates([first_issue, current_issue]) == [
+               first_issue,
+               current_issue
+             ]
+
+      assert {_output, 0} =
+               System.cmd(
+                 "git",
+                 ["-C", existing_workspace, "checkout", "-b", "feat/KYUYO_NEW-200-title"]
+               )
+
+      assert Workspace.dispatch_candidates([first_issue, current_issue]) == [current_issue]
+      assert Workspace.dispatch_candidates([first_issue]) == [first_issue]
+
+      File.write!(Path.join(existing_workspace, "local-progress.txt"), "in progress\n")
+      assert Workspace.dispatch_candidates([first_issue]) == []
+    after
+      File.rm_rf(existing_workspace)
+    end
+  end
+
   test "workspace path is deterministic per issue identifier" do
     workspace_root =
       Path.join(
@@ -59,7 +201,13 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
   test "relative local workspace roots resolve from the workflow directory" do
     workflow_dir = Path.dirname(Workflow.workflow_file_path())
-    launcher_dir = Path.join(System.tmp_dir!(), "symphony-elixir-launcher-#{System.unique_integer([:positive])}")
+
+    launcher_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-launcher-#{System.unique_integer([:positive])}"
+      )
+
     original_cwd = File.cwd!()
 
     try do
@@ -138,7 +286,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert File.read!(Path.join(second_workspace, "README.md")) == "changed\n"
       assert File.read!(Path.join(second_workspace, "local-progress.txt")) == "in progress\n"
       assert File.read!(Path.join([second_workspace, "deps", "cache.txt"])) == "cached deps\n"
-      assert File.read!(Path.join([second_workspace, "_build", "artifact.txt"])) == "compiled artifact\n"
+
+      assert File.read!(Path.join([second_workspace, "_build", "artifact.txt"])) ==
+               "compiled artifact\n"
+
       assert File.read!(Path.join([second_workspace, "tmp", "scratch.txt"])) == "remove me\n"
     after
       File.rm_rf(workspace_root)
@@ -187,7 +338,9 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
 
       assert {:ok, canonical_outside_root} = SymphonyElixir.PathSafety.canonicalize(outside_root)
-      assert {:ok, canonical_workspace_root} = SymphonyElixir.PathSafety.canonicalize(workspace_root)
+
+      assert {:ok, canonical_workspace_root} =
+               SymphonyElixir.PathSafety.canonicalize(workspace_root)
 
       assert {:error, {:workspace_outside_root, ^canonical_outside_root, ^canonical_workspace_root}} =
                Workspace.create_for_issue("MT-SYM")
@@ -383,7 +536,9 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     try do
       target_workspace = Path.join(workspace_root, "S_1")
-      untouched_workspace = Path.join(workspace_root, "OTHER-#{System.unique_integer([:positive])}")
+
+      untouched_workspace =
+        Path.join(workspace_root, "OTHER-#{System.unique_integer([:positive])}")
 
       File.mkdir_p!(target_workspace)
       File.mkdir_p!(untouched_workspace)
@@ -453,7 +608,9 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       "assignee" => %{
         "id" => "user-1"
       },
-      "labels" => %{"nodes" => [%{"name" => "Backend"}, %{"name" => " backend "}, %{"name" => " "}]},
+      "labels" => %{
+        "nodes" => [%{"name" => "Backend"}, %{"name" => " backend "}, %{"name" => " "}]
+      },
       "inverseRelations" => %{
         "nodes" => [
           %{
@@ -646,7 +803,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     workflow_store_pid = Process.whereis(WorkflowStore)
 
     missing_workflow_path =
-      Path.join(System.tmp_dir!(), "missing-bound-workflow-#{System.unique_integer([:positive])}.md")
+      Path.join(
+        System.tmp_dir!(),
+        "missing-bound-workflow-#{System.unique_integer([:positive])}.md"
+      )
 
     on_exit(fn ->
       Workflow.set_workflow_file_path(original_workflow_path)
@@ -672,6 +832,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
                },
                request_fun: fn payload, headers ->
                  send(parent, {:bound_graphql_request, payload, headers})
+
                  {:ok, %{status: 200, body: %{"data" => %{"viewer" => %{"id" => "viewer-bound"}}}}}
                end
              )
@@ -783,7 +944,11 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     }
 
     refute Orchestrator.should_dispatch_issue_for_test(issue, state)
-    assert Orchestrator.should_dispatch_issue_for_test(%{issue | labels: ["Symphony", "JavaScript"]}, state)
+
+    assert Orchestrator.should_dispatch_issue_for_test(
+             %{issue | labels: ["Symphony", "JavaScript"]},
+             state
+           )
   end
 
   test "provider-marked ready issue remains dispatch-eligible" do
@@ -831,7 +996,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              Orchestrator.revalidate_issue_for_dispatch_for_test(stale_issue, fetcher)
 
     assert skipped_issue.identifier == "MT-1005"
-    assert skipped_issue.blocked_by == [%{id: "blocker-3", identifier: "MT-1006", state: "In Progress"}]
+
+    assert skipped_issue.blocked_by == [
+             %{id: "blocker-3", identifier: "MT-1006", state: "In Progress"}
+           ]
   end
 
   test "dispatch revalidation skips an issue after a required label is removed" do
@@ -1570,7 +1738,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       read_only_settings = %{
         settings
-        | codex: %{settings.codex | turn_sandbox_policy: %{"type" => "readOnly", "networkAccess" => true}}
+        | codex: %{
+            settings.codex
+            | turn_sandbox_policy: %{"type" => "readOnly", "networkAccess" => true}
+          }
       }
 
       assert {:ok, %{"type" => "readOnly", "networkAccess" => true}} =
@@ -1578,7 +1749,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       future_settings = %{
         settings
-        | codex: %{settings.codex | turn_sandbox_policy: %{"type" => "futureSandbox", "nested" => %{"flag" => true}}}
+        | codex: %{
+            settings.codex
+            | turn_sandbox_policy: %{"type" => "futureSandbox", "nested" => %{"flag" => true}}
+          }
       }
 
       assert {:ok, %{"type" => "futureSandbox", "nested" => %{"flag" => true}}} =

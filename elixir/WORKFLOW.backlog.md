@@ -6,10 +6,7 @@ tracker:
     project_key: KYUYO_NEW
     api_key: $BACKLOG_API_KEY
     assignee_id: 449278
-  required_labels:
-    - symphony
   active_states:
-    - Open
     - In Progress
   terminal_states:
     - Resolved
@@ -22,10 +19,8 @@ server:
 observability:
   dashboard_enabled: false
 workspace:
-  root: /Users/user/AI-base/symphony-workspaces
-hooks:
-  after_create: |
-    git clone https://git.onehr.work/smartcompany/kyuyo/backend/kyuyo-backend.git .
+  mode: existing
+  root: /Users/user/IdeaProjects/kyuyo-backend
 agent:
   max_concurrent_agents: 1
   max_turns: 20
@@ -35,10 +30,16 @@ codex:
   thread_sandbox: workspace-write
   turn_sandbox_policy:
     type: workspaceWrite
+    writableRoots:
+      - /Users/user/IdeaProjects/kyuyo-backend
+      - /Users/user/symphony/workflows/kyuyo-backend
+    readOnlyAccess:
+      type: fullAccess
     networkAccess: true
 ---
 
-You are implementing Backlog ticket `{{ issue.identifier }}` in an isolated kyuyo-backend workspace.
+You are implementing Backlog ticket `{{ issue.identifier }}` in the existing kyuyo-backend repository
+at `/Users/user/IdeaProjects/kyuyo-backend`.
 
 {% if attempt %}
 This is continuation attempt {{ attempt }}. Inspect the current workspace and resume completed work.
@@ -63,27 +64,35 @@ No description was provided.
 
 Operating rules:
 
-1. Work only inside the provided workspace.
-2. Read repository governance files before editing, including applicable `AGENTS.md`, `.agents`,
-   `.codex`, and ticket-specific skills.
-3. Use the injected `backlog_api` tool for Backlog API v2 access. The host supplies credentials.
+1. Use `/Users/user/IdeaProjects/kyuyo-backend` as the only product-code working directory.
+2. Before ticket work, read
+   `/Users/user/symphony/workflows/kyuyo-backend/AGENT_WORKFLOW.md`.
+3. Read the repository-owned knowledge and rule files required by that workflow:
+   `ai-workspace/governance/KYUYO_DOMAIN.md` and
+   `ai-workspace/governance/CODING_RULES.md`.
+4. Use the injected `backlog_api` tool for Backlog API v2 access. The host supplies credentials.
    Never request, print, copy, or persist the API key.
-4. Re-fetch the issue before implementation. Read its comments and attachments when they affect
+5. Re-fetch the issue before implementation. Read its comments and attachments when they affect
    requirements.
-5. Inspect the existing branch, changes, and repository conventions before planning.
-6. Reproduce or establish a concrete code-based baseline before editing.
-7. Keep changes scoped to the ticket. Preserve unrelated work.
-8. Run tests and static checks proportional to the affected modules. Record exact results.
-9. Do not claim completion while required validation is failing.
-10. Do not change Backlog status, categories, assignee, or comments unless the ticket explicitly
+6. Inspect the existing branch, local changes, remote branch, and existing merge request before
+   planning. A branch containing `{{ issue.identifier }}` is existing ticket work and must be
+   resumed without replacement. When the current branch belongs to a different completed ticket
+   and the repository is clean, return to the repository's normal integration branch, update it,
+   and create the new ticket branch from that baseline.
+7. Reproduce or establish a concrete code-based baseline before editing.
+8. Keep changes scoped to the ticket. Preserve unrelated work.
+9. Run tests and static checks proportional to the affected modules. Record exact results.
+10. Do not claim completion while required validation is failing.
+11. Do not change Backlog status, categories, assignee, or comments unless the ticket explicitly
     requests it or the workflow below authorizes it.
 
 Execution workflow:
 
 1. Fetch `/issues/{{ issue.identifier }}` and
    `/issues/{{ issue.identifier }}/comments` with `backlog_api`.
-2. Create or reuse a ticket branch named `feat/{{ issue.identifier }}`. If an existing branch
-   already contains ticket work, continue it without discarding changes.
+2. Reuse the current ticket branch when its name contains `{{ issue.identifier }}`. When a branch
+   must be created, follow the kyuyo branch rule `<scope>/<Backlog title>` and preserve the complete
+   title where Git permits it.
 3. Build a concise implementation and validation plan from the ticket and actual code.
 4. Implement the smallest complete change.
 5. Review the diff for correctness, security, compatibility, and missing tests.

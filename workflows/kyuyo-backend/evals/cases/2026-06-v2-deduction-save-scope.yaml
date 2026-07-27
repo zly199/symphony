@@ -1,0 +1,67 @@
+id: 2026-06-v2-deduction-save-scope
+title: Kyuyo-v2 deduction save work must stay in the validated save path and use real v2 fields
+source_period: 2026-06-05_to_2026-06-10
+tags:
+  - kyuyo-v2
+  - deduction-setting
+  - implementation-plan
+  - save-validation
+  - regression
+trigger_when:
+  - Kyuyo-v2 deduction-setting save flow changes
+  - DeductionSettingV2Service or DeductionSettingV2Api changes
+  - InfoSheetBaseService.returnFormat changes for deduction item ordering
+case_input:
+  user_prompt: >
+    v2 控除項目保存时，默认 item 不可修改就行。显示模式是前端事情，
+    保存逻辑里面加 check。顺便 returnFormat 里排序用 v2 实际存在的字段。
+  available_context:
+    - BaseCRUDApi.upsert(ctx) already handles the common save path.
+    - DeductionSettingV2Service has beforeMutation(...), upsertAfter(...), and deleteAfter(...) hooks.
+    - v2 DeductionItemSettingV2 does not have a sort field for this use case.
+    - The validated ordering fix uses id ASC and sorts map.get("itemDefinitions") by id inside InfoSheetBaseService.returnFormat(...)
+      under DeductionItemInformation.FORM_ID.
+    - The validated default-item guard belongs in DeductionSettingV2Service.beforeMutation(...).
+    - The validated error contract is DEDUCTION_DEFAULT_ITEM_CANNOT_EDIT(400) with message
+      デフォルト項目の加算/減算、金額算出方法は変更できません。
+expected_behavior:
+  - Keep the implementation plan inside kyuyo-v2 save logic.
+  - Use BaseCRUDApi.upsert(ctx) as the controller-level save path instead of inventing a separate save flow.
+  - Put locked-field validation in DeductionSettingV2Service.beforeMutation(...).
+  - Compare incoming default item with the persisted DB record before super.beforeMutation(...).
+  - Keep UI display-mode decisions out of the backend scope.
+  - Sort v2 deduction itemDefinitions by id, not by a non-existent sort field.
+  - Prefer the direct InfoSheetBaseService.returnFormat call-site edit if that is sufficient.
+  - Stop automated test execution if the user says they will run tests, and report the latest known validation state.
+hard_checks:
+  must_include:
+    - BaseCRUDApi.upsert
+    - DeductionSettingV2Service.beforeMutation
+    - DEDUCTION_DEFAULT_ITEM_CANNOT_EDIT
+    - InfoSheetBaseService.returnFormat
+    - id
+  must_not_include:
+    - sortByDeductionItemSetting as a required v2 helper
+    - v2 sort field assumption
+    - display-mode backend redesign
+    - reflection to bypass module dependency
+    - direct kyuyo-v2 dependency on kyuyo-v1 business service
+semantic_rubric:
+  score_0:
+    - Proposes a new route or controller shape without matching existing save patterns.
+    - Uses a v1 sort assumption in v2.
+    - Moves UI display concerns into backend save validation.
+  score_1:
+    - Chooses the right service hook but leaves persisted-record comparison or error contract unclear.
+    - Identifies id sorting but adds unnecessary helper abstraction.
+  score_2:
+    - Uses the existing upsert path and service hooks.
+    - Places default-item immutability in beforeMutation with the validated error code.
+    - Uses direct id sorting in returnFormat with minimal scope.
+blocking_failures:
+  - Any plan that depends on a v2 sort field for DeductionItemSettingV2.
+  - Any plan that handles default-item immutability only in the read/display path.
+  - Any plan that bypasses module boundaries through reflection, string class names, or runtime service lookup.
+evaluator_notes:
+  - This eval should catch scope drift from a save-path requirement into display-model redesign.
+  - It should also catch carrying v1 entity assumptions into kyuyo-v2.

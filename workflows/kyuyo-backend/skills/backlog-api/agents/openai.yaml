@@ -1,0 +1,4 @@
+interface:
+  display_name: "Backlog API"
+  short_description: "Read Backlog projects and issues via API key"
+  default_prompt: "Use Backlog API to read projects or issues, execute safe GET-only queries directly, and summarize findings. Ask only before any write or mutating action."

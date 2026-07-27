@@ -116,12 +116,32 @@ defmodule SymphonyElixir.Config do
   @doc false
   @spec validate_settings(Schema.t()) :: :ok | {:error, term()}
   def validate_settings(settings) do
-    if is_nil(settings.tracker.kind) do
-      {:error, :missing_tracker_kind}
-    else
-      Tracker.validate_config(settings.tracker)
+    with :ok <- validate_workspace_settings(settings) do
+      if is_nil(settings.tracker.kind) do
+        {:error, :missing_tracker_kind}
+      else
+        Tracker.validate_config(settings.tracker)
+      end
     end
   end
+
+  defp validate_workspace_settings(%{workspace: %{mode: "existing"}} = settings) do
+    cond do
+      settings.agent.max_concurrent_agents != 1 ->
+        {:error, :existing_workspace_requires_single_agent}
+
+      settings.worker.ssh_hosts != [] ->
+        {:error, :existing_workspace_does_not_support_ssh_workers}
+
+      not is_nil(settings.hooks.after_create) ->
+        {:error, :existing_workspace_does_not_support_after_create}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_workspace_settings(_settings), do: :ok
 
   defp format_config_error(reason) do
     case reason do
