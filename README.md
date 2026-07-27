@@ -34,6 +34,11 @@ help with the setup:
 > Set up Symphony for my repository based on
 > https://github.com/openai/symphony/blob/main/elixir/README.md
 
+### Maintaining this personal fork
+
+See [CUSTOMIZATION.md](CUSTOMIZATION.md) for the branch model, local worktree layout, and commands
+for syncing updates from the official Symphony repository.
+
 ---
 
 ## License
