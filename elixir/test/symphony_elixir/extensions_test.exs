@@ -446,6 +446,8 @@ defmodule SymphonyElixir.ExtensionsTest do
     start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
 
     html = html_response(get(build_conn(), "/"), 200)
+    assert html =~ ~s(<html lang="zh-CN">)
+    assert html =~ "<title>Symphony 可观测性</title>"
     assert html =~ ~r|/dashboard\.css\?v=[0-9a-f]{12}|
 
     assert html =~
@@ -499,21 +501,23 @@ defmodule SymphonyElixir.ExtensionsTest do
     start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
 
     {:ok, view, html} = live(build_conn(), "/")
-    assert html =~ "Operations Dashboard"
+    assert html =~ "运行监控台"
     assert html =~ "MT-HTTP"
     assert html =~ "MT-RETRY"
     assert html =~ "MT-BLOCKED"
     assert html =~ ~s(href="https://example.org/issues/MT-HTTP")
     assert html =~ ~s(href="https://example.org/issues/MT-RETRY")
     assert html =~ ~s(href="https://example.org/issues/MT-BLOCKED")
-    assert html =~ ~s(aria-label="Open MT-HTTP in the issue tracker")
+    assert html =~ ~s(aria-label="在问题跟踪系统中打开 MT-HTTP")
     assert html =~ "rendered"
     assert html =~ "turn blocked: waiting for user input"
-    assert html =~ "Runtime"
-    assert html =~ "Live"
-    assert html =~ "Offline"
-    assert html =~ "Copy ID"
-    assert html =~ "Codex update"
+    assert html =~ "运行时长"
+    assert html =~ "实时"
+    assert html =~ "离线"
+    assert html =~ "复制 ID"
+    assert html =~ "Codex 动态"
+    assert html =~ "速率限制"
+    assert html =~ "重试队列"
     refute html =~ "data-runtime-clock="
     refute html =~ "setInterval(refreshRuntimeClocks"
     refute html =~ "Refresh now"
@@ -572,7 +576,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     )
 
     {:ok, _view, html} = live(build_conn(), "/")
-    assert html =~ "Snapshot unavailable"
+    assert html =~ "无法获取状态快照"
     assert html =~ "snapshot_unavailable"
   end
 
