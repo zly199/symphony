@@ -62,10 +62,10 @@ Asia/Tokyo.
 
 Each run:
 
-1. Verifies that both local worktrees are clean.
+1. Verifies that the `custom` worktree is clean and matches `origin/custom`.
 2. Fetches the latest branches from `upstream` and `origin`.
-3. Fast-forwards the clean local `main` branch to `upstream/main`.
-4. Pushes the synchronized `main` branch to `origin/main`.
+3. Verifies that `origin/main` can fast-forward to `upstream/main`.
+4. Pushes the official `upstream/main` commit directly to `origin/main`.
 5. Merges `upstream/main` into the primary `custom` branch.
 6. Runs the relevant Elixir formatting and test checks.
 7. Pushes a successful update to `origin/custom`.
