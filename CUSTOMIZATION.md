@@ -11,14 +11,14 @@ all future personal changes are developed and maintained on this branch.
 The active local development worktree is:
 
 ```bash
-cd /Users/user/AI-base/symphony-custom
+cd /Users/user/symphony
 git branch --show-current
 # custom
 ```
 
-The `main` branch remains a clean synchronization baseline for the official
-repository. It is maintained in a separate worktree and is not used for personal
-development.
+The `main` branch remains a synchronization baseline for the official repository.
+It does not need a separate local worktree because the official commit can be
+pushed directly from `upstream/main` to `origin/main`.
 
 ## Repository layout
 
@@ -28,32 +28,32 @@ development.
 | `origin` | Personal fork: `https://github.com/zly199/symphony.git` |
 | `main` | Clean mirror of `upstream/main` |
 | `custom` | Primary branch for the Backlog adapter and future personal changes |
-| `/Users/user/symphony` | Local worktree for `main` |
-| `/Users/user/AI-base/symphony-custom` | Local worktree for `custom` |
+| `/Users/user/symphony` | The only local worktree, checked out on `custom` |
 
 Keep personal development on `custom`. Use short-lived feature branches from
 `custom` when a change needs isolated review.
 
 ## Sync the official repository
 
-First update the clean `main` worktree:
+Fetch both repositories and update the fork's clean `main` reference:
 
 ```bash
-git -C /Users/user/symphony fetch upstream
-git -C /Users/user/symphony merge --ff-only upstream/main
-git -C /Users/user/symphony push origin main
+cd /Users/user/symphony
+git fetch upstream main
+git fetch origin main custom
+git merge-base --is-ancestor origin/main upstream/main
+git push origin upstream/main:main
 ```
 
-Then merge the official updates into the personal branch:
+Then merge the official updates into the primary branch:
 
 ```bash
-git -C /Users/user/AI-base/symphony-custom fetch upstream
-git -C /Users/user/AI-base/symphony-custom merge upstream/main
-git -C /Users/user/AI-base/symphony-custom push origin custom
+git merge upstream/main
+git push origin custom
 ```
 
-Resolve any merge conflicts in the `custom` worktree, run the relevant tests,
-and complete the merge commit before pushing.
+Resolve any merge conflicts, run the relevant tests, and complete the merge
+commit before pushing.
 
 ## Weekly automatic synchronization
 
@@ -77,7 +77,7 @@ work.
 ## Daily development
 
 ```bash
-cd /Users/user/AI-base/symphony-custom
+cd /Users/user/symphony
 git status
 # edit and verify changes
 git add <files>
