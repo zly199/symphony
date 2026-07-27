@@ -72,6 +72,13 @@ Instructions:
 
 Work only in the provided repository copy. Do not touch any other path.
 
+## Tracker contract
+
+This reference prompt targets Linear. When adapting it to Backlog, replace the Linear-specific
+status map, workpad behavior, and related skills with your Backlog workflow. Use the injected
+`backlog_api` tool for Backlog API v2 reads and form-encoded mutations; the host supplies the API
+key.
+
 ## Prerequisite: Linear MCP or `linear_graphql` tool is available
 
 The agent should be able to talk to Linear, either via a configured Linear MCP server or injected `linear_graphql` tool. If neither is present, treat that as blocked access: record it in the workpad and move the issue according to the workflow instead of asking a user to configure Linear.

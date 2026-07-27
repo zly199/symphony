@@ -12,6 +12,7 @@ defmodule SymphonyElixir.Tracker do
 
   @adapters %{
     "asana" => SymphonyElixir.Asana.Adapter,
+    "backlog" => SymphonyElixir.Backlog.Adapter,
     "github" => SymphonyElixir.GitHub.Adapter,
     "gitlab" => SymphonyElixir.GitLab.Adapter,
     "jira" => SymphonyElixir.Jira.Adapter,

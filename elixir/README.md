@@ -21,11 +21,11 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 4. Sends a workflow prompt to Codex
 5. Keeps Codex working on the issue until the work is done
 
-During app-server sessions, the selected tracker adapter may advertise provider-native tools. The
-Linear serves `linear_graphql`, GitHub Issues serves `github_api`, Jira Cloud serves
-`jira_rest`, Asana serves `asana_api`, and GitLab serves `gitlab_api`. Symphony executes those
-tools with configured host-side auth and removes declared tracker-token environment variables from
-the Codex child, so the agent does not need a second tracker login.
+During app-server sessions, the selected tracker adapter may advertise provider-native tools.
+Linear serves `linear_graphql`, Backlog serves `backlog_api`, GitHub Issues serves `github_api`,
+Jira Cloud serves `jira_rest`, Asana serves `asana_api`, and GitLab serves `gitlab_api`. Symphony
+executes those tools with configured host-side auth and removes declared tracker-token environment
+variables from the Codex child, so the agent does not need a second tracker login.
 
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.
@@ -39,8 +39,9 @@ tracker issue can become a dispatch candidate again after restart.
 
 1. Make sure your codebase is set up to work well with agents: see
    [Harness engineering](https://openai.com/index/harness-engineering/).
-2. Get a new personal token in Linear via Settings → Security & access → Personal API keys, and
-   set it as the `LINEAR_API_KEY` environment variable.
+2. Get a credential for the selected tracker. For Linear, create a personal token via
+   Settings → Security & access → Personal API keys and export `LINEAR_API_KEY`. For Backlog,
+   create an API key under Personal Settings → API and export `BACKLOG_API_KEY`.
 3. Copy this directory's `WORKFLOW.md` to your repo.
 4. Optionally copy the `commit`, `push`, `pull`, `land`, and `linear` skills to your repo.
    - The `linear` skill expects Symphony's `linear_graphql` app-server tool for raw Linear GraphQL
@@ -173,6 +174,9 @@ Notes:
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - For the Linear adapter, `tracker.provider.api_key` reads from `LINEAR_API_KEY` when unset or
   when value is `$LINEAR_API_KEY`. The legacy flat `tracker.api_key` alias behaves the same way.
+- For the Backlog adapter, `tracker.provider.api_key` reads from `BACKLOG_API_KEY` when unset or
+  when value is `$BACKLOG_API_KEY`. Keep API keys in the host environment because Backlog
+  authenticates API requests with an `apiKey` query parameter.
 - Do not put a literal tracker token in a repo-owned `WORKFLOW.md` if Codex can read that
   workspace. Use `$VAR`/host-side secret references so Symphony can keep the token out of the
   child environment.
@@ -241,6 +245,52 @@ codex:
   `tracker_response` (`429` is `tracker_rate_limited`), GraphQL/unknown payload failures to
   `tracker_payload`, and missing cursors to `tracker_pagination`; logs and tool responses carry the
   human-readable provider detail.
+
+### Backlog adapter
+
+- Config: use `tracker.kind: backlog` with required `tracker.provider.project_key`, explicit
+  `active_states` and `terminal_states`, and one Backlog location:
+  - `base_url` such as `https://example.backlog.com` or
+    `https://example.backlog.com/api/v2`; it defaults to `BACKLOG_BASE_URL`.
+  - `space` such as `example`; it defaults to `BACKLOG_SPACE` and resolves to
+    `https://example.backlog.com/api/v2`.
+  - `domain` such as `example.backlogtool.com`; it defaults to `BACKLOG_DOMAIN`.
+  `api_key` defaults to `BACKLOG_API_KEY` and accepts `$VAR`. Optional `assignee_id` defaults to
+  `BACKLOG_ASSIGNEE_ID` and limits candidates to that numeric Backlog user ID.
+- Scope and paging: candidate reads resolve the configured project and project status list, map
+  configured state names to Backlog status IDs, then page `/issues` in batches of 100. State
+  matching ignores case and surrounding whitespace. ID refreshes use Backlog's immutable numeric
+  issue ID, omit `404` records, and reject issues outside the configured project.
+- Identity and normalization: `issue.id` is the numeric Backlog issue ID as a string and
+  `issue.identifier` is the native issue key such as `PROJECT-123`. Category names become
+  normalized Symphony labels, Backlog priority IDs remain integer priorities, and malformed
+  timestamps become `nil`. Backlog does not expose a generic issue-dependency relation, so
+  `blocked_by` remains empty.
+- Tool and auth: `backlog_api` accepts `GET`, `POST`, `PATCH`, or `DELETE`, a relative API v2
+  `path`, optional `query`, and optional form-encoded `form` fields. Symphony appends the API key
+  host-side, rejects caller-supplied `apiKey` values, strips `BACKLOG_API_KEY` and configured
+  `$VAR` token names from the Codex child, and keeps transport errors from echoing credential-bearing
+  URLs. The raw tool can access any Backlog API resource allowed by the configured key, so use a
+  dedicated least-privilege account in a trusted environment.
+- Errors: configuration failures use `:invalid_backlog_base_url`, `:missing_backlog_api_key`,
+  `:missing_backlog_project_key`, `:invalid_backlog_project_key`, or
+  `:invalid_backlog_assignee_id`. Request failures use `{:backlog_api_status, status}` or
+  `{:backlog_api_request, reason}`; malformed responses use `:backlog_unknown_payload`.
+
+Example:
+
+```yaml
+tracker:
+  kind: backlog
+  provider:
+    base_url: $BACKLOG_BASE_URL
+    project_key: "PROJECT"
+    api_key: $BACKLOG_API_KEY
+    assignee_id: $BACKLOG_ASSIGNEE_ID
+  required_labels: ["symphony"]
+  active_states: ["Open", "In Progress"]
+  terminal_states: ["Closed"]
+```
 
 ### GitHub Issues adapter
 

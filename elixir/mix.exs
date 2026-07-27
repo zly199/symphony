@@ -14,6 +14,7 @@ defmodule SymphonyElixir.MixProject do
         ],
         ignore_modules: [
           SymphonyElixir.Asana.Client,
+          SymphonyElixir.Backlog.Client,
           SymphonyElixir.Config,
           SymphonyElixir.GitHub.Client,
           SymphonyElixir.GitLab.Client,
