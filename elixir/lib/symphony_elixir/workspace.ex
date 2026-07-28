@@ -10,12 +10,14 @@ defmodule SymphonyElixir.Workspace do
 
   @type worker_host :: String.t() | nil
   @default_repository_branches ["main", "master", "develop", "development"]
+  @worktree_remote "origin"
 
   @spec create_for_issue(map() | String.t() | nil, worker_host()) ::
           {:ok, Path.t()} | {:error, term()}
   def create_for_issue(issue_or_identifier, worker_host \\ nil) do
     case Config.settings!().workspace.mode do
       "existing" -> use_existing_workspace(worker_host)
+      "worktree" -> create_worktree_workspace(issue_or_identifier, worker_host)
       _ -> create_per_issue_workspace(issue_or_identifier, worker_host)
     end
   end
@@ -108,6 +110,151 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
+  defp create_worktree_workspace(issue_or_identifier, nil) do
+    with {:ok, repository} <- worktree_repository(),
+         {:ok, workspace} <- workspace_path_for_issue(workspace_key(issue_or_identifier), nil),
+         :ok <- validate_workspace_path(workspace, nil) do
+      ensure_worktree(repository, workspace)
+    end
+  end
+
+  defp create_worktree_workspace(_issue_or_identifier, worker_host) when is_binary(worker_host) do
+    {:error, {:worktree_workspace_unsupported_worker, worker_host}}
+  end
+
+  defp worktree_repository do
+    case Config.workspace_repository() do
+      repository when is_binary(repository) ->
+        case PathSafety.canonicalize(repository) do
+          {:ok, canonical_repository} ->
+            if File.exists?(Path.join(canonical_repository, ".git")) do
+              {:ok, canonical_repository}
+            else
+              {:error, {:worktree_repository_missing, canonical_repository}}
+            end
+
+          {:error, {:path_canonicalize_failed, path, reason}} ->
+            {:error, {:workspace_path_unreadable, path, reason}}
+        end
+
+      nil ->
+        {:error, :worktree_repository_not_configured}
+    end
+  end
+
+  defp ensure_worktree(repository, workspace) do
+    run_git(repository, ["worktree", "prune"])
+
+    if File.dir?(workspace) do
+      reuse_worktree(workspace)
+    else
+      File.mkdir_p!(Path.dirname(workspace))
+      add_worktree(repository, workspace)
+    end
+  end
+
+  defp reuse_worktree(workspace) do
+    case run_git(workspace, ["rev-parse", "--is-inside-work-tree"]) do
+      {:ok, "true"} ->
+        {:ok, workspace}
+
+      _ ->
+        {:error, {:worktree_path_occupied, workspace}}
+    end
+  end
+
+  defp add_worktree(repository, workspace) do
+    fetch_worktree_remote(repository)
+
+    with {:ok, base_ref} <- worktree_base_ref(repository) do
+      case run_git(repository, ["worktree", "add", "--detach", workspace, base_ref]) do
+        {:ok, _output} ->
+          Logger.info("Created git worktree repository=#{repository} workspace=#{workspace} base_ref=#{base_ref}")
+
+          {:ok, workspace}
+
+        {:error, {status, output}} ->
+          {:error, {:worktree_add_failed, workspace, status, output}}
+      end
+    end
+  end
+
+  defp fetch_worktree_remote(repository) do
+    case run_git(repository, ["fetch", @worktree_remote]) do
+      {:ok, _output} ->
+        :ok
+
+      {:error, {status, output}} ->
+        Logger.warning("Failed to fetch #{@worktree_remote} before creating a worktree repository=#{repository} status=#{status} output=#{inspect(output)}")
+
+        :ok
+    end
+  end
+
+  defp worktree_base_ref(repository) do
+    case Config.settings!().workspace.base_ref do
+      base_ref when is_binary(base_ref) and base_ref != "" ->
+        if worktree_ref_exists?(repository, base_ref) do
+          {:ok, base_ref}
+        else
+          {:error, {:worktree_base_ref_missing, repository, [base_ref]}}
+        end
+
+      _ ->
+        default_worktree_base_ref(repository)
+    end
+  end
+
+  defp default_worktree_base_ref(repository) do
+    candidates =
+      ["#{@worktree_remote}/HEAD" | Enum.map(@default_repository_branches, &"#{@worktree_remote}/#{&1}")]
+
+    case Enum.find(candidates, &worktree_ref_exists?(repository, &1)) do
+      nil -> {:error, {:worktree_base_ref_missing, repository, candidates}}
+      base_ref -> {:ok, base_ref}
+    end
+  end
+
+  defp worktree_ref_exists?(repository, ref) do
+    match?({:ok, _commit}, run_git(repository, ["rev-parse", "--verify", "--quiet", ref <> "^{commit}"]))
+  end
+
+  defp remove_worktree(workspace) do
+    with true <- File.exists?(workspace),
+         {:ok, repository} <- worktree_repository() do
+      case run_git(repository, ["worktree", "remove", workspace]) do
+        {:ok, _output} ->
+          run_git(repository, ["worktree", "prune"])
+          {:ok, []}
+
+        {:error, {status, output}} ->
+          Logger.warning("Keeping git worktree that still holds local state workspace=#{workspace} status=#{status} output=#{inspect(output)}")
+
+          {:ok, []}
+      end
+    else
+      false ->
+        {:ok, []}
+
+      {:error, reason} ->
+        Logger.warning("Skipping worktree removal workspace=#{workspace} reason=#{inspect(reason)}")
+
+        {:ok, []}
+    end
+  end
+
+  defp run_git(directory, args) when is_binary(directory) and is_list(args) do
+    {output, status} = System.cmd("git", ["-C", directory | args], stderr_to_stdout: true)
+
+    case status do
+      0 -> {:ok, String.trim(output)}
+      _ -> {:error, {status, String.trim(output)}}
+    end
+  rescue
+    error in [ArgumentError, ErlangError] ->
+      {:error, {:git_unavailable, Exception.message(error)}}
+  end
+
   defp use_existing_workspace(nil) do
     workspace = Config.local_workspace_root()
 
@@ -185,10 +332,16 @@ defmodule SymphonyElixir.Workspace do
 
   @spec remove(Path.t(), worker_host()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
   def remove(workspace, nil) do
-    if existing_workspace_mode?() do
-      {:ok, []}
-    else
-      remove_local_workspace_if_safe(workspace)
+    case workspace_mode() do
+      "existing" ->
+        {:ok, []}
+
+      "worktree" ->
+        maybe_run_before_remove_hook(workspace, nil)
+        remove_worktree(workspace)
+
+      _ ->
+        remove_local_workspace_if_safe(workspace)
     end
   end
 
@@ -218,8 +371,12 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
+  defp workspace_mode do
+    Config.settings!().workspace.mode
+  end
+
   defp existing_workspace_mode? do
-    Config.settings!().workspace.mode == "existing"
+    workspace_mode() == "existing"
   end
 
   defp remove_local_workspace_if_safe(workspace) do
@@ -250,6 +407,9 @@ defmodule SymphonyElixir.Workspace do
 
       Path.type(workspace) != :absolute ->
         {:error, {:workspace_path_unreadable, workspace, :not_absolute}, ""}
+
+      workspace_mode() == "worktree" ->
+        remove(workspace, nil)
 
       true ->
         remove_validated_recorded_workspace(workspace)

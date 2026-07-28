@@ -40,6 +40,127 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "worktree workspace mode isolates each issue from the source checkout" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-worktree-workspace-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      repository = seed_worktree_repository!(test_root)
+      workspace_root = Path.join(test_root, "worktrees")
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_mode: "worktree",
+        workspace_root: workspace_root,
+        workspace_repository: repository,
+        max_concurrent_agents: 1
+      )
+
+      assert :ok = Config.validate!()
+
+      assert {:ok, workspace} = Workspace.create_for_issue("MT-WORKTREE")
+
+      assert {:ok, canonical_workspace_root} =
+               SymphonyElixir.PathSafety.canonicalize(workspace_root)
+
+      assert Path.dirname(workspace) == canonical_workspace_root
+      assert File.exists?(Path.join(workspace, ".git"))
+      assert File.read!(Path.join(workspace, "README.md")) == "worktree base\n"
+
+      # The source checkout keeps its own branch and stays untouched.
+      assert {"master\n", 0} = System.cmd("git", ["-C", repository, "branch", "--show-current"])
+
+      # A dirty worktree survives cleanup so ticket work is never dropped.
+      File.write!(Path.join(workspace, "in-progress.txt"), "work\n")
+      assert {:ok, []} = Workspace.remove_recorded(workspace, nil)
+      assert File.exists?(Path.join(workspace, "in-progress.txt"))
+
+      # Reuse returns the same worktree instead of recreating it.
+      assert {:ok, ^workspace} = Workspace.create_for_issue("MT-WORKTREE")
+
+      File.rm!(Path.join(workspace, "in-progress.txt"))
+      assert {:ok, []} = Workspace.remove_recorded(workspace, nil)
+      refute File.exists?(workspace)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "worktree workspace mode rejects unsafe runtime combinations" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-worktree-workspace-config-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      repository = seed_worktree_repository!(test_root)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_mode: "worktree",
+        workspace_root: Path.join(test_root, "worktrees"),
+        max_concurrent_agents: 1
+      )
+
+      assert {:error, :worktree_workspace_requires_repository} = Config.validate!()
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_mode: "worktree",
+        workspace_root: Path.join(test_root, "worktrees"),
+        workspace_repository: repository,
+        max_concurrent_agents: 1,
+        worker_ssh_hosts: ["worker-01"]
+      )
+
+      assert {:error, :worktree_workspace_does_not_support_ssh_workers} = Config.validate!()
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "worktree workspace mode reports a missing source repository" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-worktree-missing-repository-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      missing_repository = Path.join(test_root, "missing")
+      File.mkdir_p!(missing_repository)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_mode: "worktree",
+        workspace_root: Path.join(test_root, "worktrees"),
+        workspace_repository: missing_repository,
+        max_concurrent_agents: 1
+      )
+
+      assert {:error, {:worktree_repository_missing, _repository}} =
+               Workspace.create_for_issue("MT-WORKTREE-MISSING")
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  defp seed_worktree_repository!(test_root) do
+    repository = Path.join(test_root, "source")
+    File.mkdir_p!(repository)
+    File.write!(Path.join(repository, "README.md"), "worktree base\n")
+
+    System.cmd("git", ["-C", repository, "init", "-b", "master"])
+    System.cmd("git", ["-C", repository, "config", "user.name", "Test User"])
+    System.cmd("git", ["-C", repository, "config", "user.email", "test@example.com"])
+    System.cmd("git", ["-C", repository, "add", "README.md"])
+    System.cmd("git", ["-C", repository, "commit", "-m", "initial"])
+    # Stand in for the fetched baseline the orchestrator branches worktrees from.
+    System.cmd("git", ["-C", repository, "update-ref", "refs/remotes/origin/master", "HEAD"])
+
+    repository
+  end
+
   test "existing workspace mode uses the configured directory and preserves it during cleanup" do
     existing_workspace =
       Path.join(

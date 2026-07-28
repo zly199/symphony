@@ -113,13 +113,15 @@ defmodule SymphonyElixir.Config.Schema do
     embedded_schema do
       field(:mode, :string, default: "per_issue")
       field(:root, :string, default: Path.join(System.tmp_dir!(), "symphony_workspaces"))
+      field(:repository, :string)
+      field(:base_ref, :string)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:mode, :root], empty_values: [])
-      |> validate_inclusion(:mode, ["per_issue", "existing"])
+      |> cast(attrs, [:mode, :root, :repository, :base_ref], empty_values: [])
+      |> validate_inclusion(:mode, ["per_issue", "existing", "worktree"])
     end
   end
 
@@ -462,7 +464,8 @@ defmodule SymphonyElixir.Config.Schema do
           resolve_path_value(
             settings.workspace.root,
             Path.join(System.tmp_dir!(), "symphony_workspaces")
-          )
+          ),
+        repository: resolve_path_value(settings.workspace.repository, nil)
     }
 
     codex = %{
@@ -524,6 +527,8 @@ defmodule SymphonyElixir.Config.Schema do
         path
     end
   end
+
+  defp resolve_path_value(_value, default), do: default
 
   defp resolve_env_value(value, fallback) when is_binary(value) do
     case env_reference_name(value) do

@@ -110,6 +110,8 @@ defmodule SymphonyElixir.TestSupport do
           poll_interval_ms: 30_000,
           workspace_mode: "per_issue",
           workspace_root: Path.join(System.tmp_dir!(), "symphony_workspaces"),
+          workspace_repository: nil,
+          workspace_base_ref: nil,
           worker_ssh_hosts: [],
           worker_max_concurrent_agents_per_host: nil,
           max_concurrent_agents: 10,
@@ -151,6 +153,8 @@ defmodule SymphonyElixir.TestSupport do
     poll_interval_ms = Keyword.get(config, :poll_interval_ms)
     workspace_mode = Keyword.get(config, :workspace_mode)
     workspace_root = Keyword.get(config, :workspace_root)
+    workspace_repository = Keyword.get(config, :workspace_repository)
+    workspace_base_ref = Keyword.get(config, :workspace_base_ref)
     worker_ssh_hosts = Keyword.get(config, :worker_ssh_hosts)
 
     worker_max_concurrent_agents_per_host =
@@ -196,6 +200,8 @@ defmodule SymphonyElixir.TestSupport do
         "workspace:",
         "  mode: #{yaml_value(workspace_mode)}",
         "  root: #{yaml_value(workspace_root)}",
+        "  repository: #{yaml_value(workspace_repository)}",
+        "  base_ref: #{yaml_value(workspace_base_ref)}",
         worker_yaml(worker_ssh_hosts, worker_max_concurrent_agents_per_host),
         "agent:",
         "  max_concurrent_agents: #{yaml_value(max_concurrent_agents)}",

@@ -614,8 +614,10 @@ not require recognizing or validating extension fields unless that extension is 
 - `tracker.active_states`: list of provider-native state names, adapter-defined default
 - `tracker.terminal_states`: list of provider-native state names, adapter-defined default
 - `polling.interval_ms`: integer, default `30000`
-- `workspace.mode`: `per_issue` or `existing`, default `per_issue`
+- `workspace.mode`: `per_issue`, `existing`, or `worktree`, default `per_issue`
 - `workspace.root`: path resolved to absolute, default `<system-temp>/symphony_workspaces`
+- `workspace.repository`: path resolved to absolute, REQUIRED for `worktree` mode, otherwise null
+- `workspace.base_ref`: ref new worktrees are created from, default resolved from the remote
 - `hooks.after_create`: shell script or null
 - `hooks.before_run`: shell script or null
 - `hooks.after_run`: shell script or null
@@ -861,6 +863,7 @@ Workspace path:
 
 - `workspace.mode=per_issue`: `<workspace.root>/<workspace_key>`
 - `workspace.mode=existing`: `<workspace.root>`
+- `workspace.mode=worktree`: `<workspace.root>/<workspace_key>`
 
 Workspace persistence:
 
@@ -890,6 +893,16 @@ For the optional high-trust `workspace.mode=existing` extension:
 3. Require a single concurrent agent and local execution.
 4. Reject `after_create`.
 5. Preserve the configured directory during all workspace cleanup paths.
+
+For the optional `workspace.mode=worktree` extension:
+
+1. Require `workspace.repository` to be an existing Git repository and local execution.
+2. Derive `workspace_key` using Section 4.2 and compute the workspace path under workspace root.
+3. Reuse the path when it already is a Git worktree.
+4. Otherwise fetch the remote, resolve `workspace.base_ref`, and add a detached worktree at the
+   workspace path.
+5. On cleanup, remove the worktree non-destructively so a worktree holding uncommitted work is kept.
+6. Never change the branch or working tree of `workspace.repository`.
 
 Notes:
 

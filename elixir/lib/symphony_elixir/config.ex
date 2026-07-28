@@ -88,8 +88,25 @@ defmodule SymphonyElixir.Config do
   @doc false
   @spec local_workspace_root() :: Path.t()
   def local_workspace_root do
-    workflow_dir = Workflow.workflow_file_path() |> Path.expand() |> Path.dirname()
-    Path.expand(settings!().workspace.root, workflow_dir)
+    Path.expand(settings!().workspace.root, workflow_dir())
+  end
+
+  @doc """
+  Returns the source repository used by `workspace.mode: "worktree"`, or `nil` when unset.
+  """
+  @spec workspace_repository() :: Path.t() | nil
+  def workspace_repository do
+    case settings!().workspace.repository do
+      repository when is_binary(repository) and repository != "" ->
+        Path.expand(repository, workflow_dir())
+
+      _ ->
+        nil
+    end
+  end
+
+  defp workflow_dir do
+    Workflow.workflow_file_path() |> Path.expand() |> Path.dirname()
   end
 
   @spec validate!() :: :ok | {:error, term()}
@@ -135,6 +152,19 @@ defmodule SymphonyElixir.Config do
 
       not is_nil(settings.hooks.after_create) ->
         {:error, :existing_workspace_does_not_support_after_create}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_workspace_settings(%{workspace: %{mode: "worktree"} = workspace} = settings) do
+    cond do
+      not is_binary(workspace.repository) or String.trim(workspace.repository) == "" ->
+        {:error, :worktree_workspace_requires_repository}
+
+      settings.worker.ssh_hosts != [] ->
+        {:error, :worktree_workspace_does_not_support_ssh_workers}
 
       true ->
         :ok

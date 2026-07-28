@@ -90,6 +90,8 @@ git push
 The local Symphony dashboard remains available at
 `http://127.0.0.1:4000` while the Backlog LaunchAgent is running.
 
-The Backlog workflow uses `workspace.mode: existing`. It runs one agent directly in
-`/Users/user/IdeaProjects/kyuyo-backend`, follows the ticket identifier on the current branch, and
-preserves the repository when a ticket reaches a terminal state.
+The Backlog workflow uses `workspace.mode: worktree`. Each ticket runs in its own Git worktree
+under `/Users/user/IdeaProjects/kyuyo-worktrees`, created from `origin/master` of
+`/Users/user/IdeaProjects/kyuyo-backend`. The source checkout keeps its own branch and working tree,
+so it stays free for manual work while an agent runs. A worktree is removed only when its ticket
+reaches a terminal state and it holds no uncommitted work.

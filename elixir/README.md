@@ -154,6 +154,13 @@ Notes:
   `<workspace.root>/<workspace_key>`. The optional `existing` mode runs Codex directly in
   `workspace.root`, requires `agent.max_concurrent_agents: 1`, rejects SSH workers and
   `hooks.after_create`, and preserves that directory during terminal cleanup.
+- The optional `worktree` mode gives every issue its own Git worktree at
+  `<workspace.root>/<workspace_key>`, created from `workspace.repository`. It requires
+  `workspace.repository`, rejects SSH workers, and leaves the source checkout untouched so it stays
+  available for manual work. New worktrees are added detached at `workspace.base_ref`, which
+  defaults to the first existing ref among `origin/HEAD`, `origin/main`, `origin/master`,
+  `origin/develop`, and `origin/development`. Terminal cleanup runs `git worktree remove`, which
+  keeps any worktree that still holds uncommitted work.
 - Existing-workspace dispatch follows the ticket identifier in the current Git branch. A clean
   `main`, `master`, `develop`, or `development` branch can accept a new ticket. A ticket branch
   dispatches its matching active ticket. When that ticket leaves the active set, a clean branch

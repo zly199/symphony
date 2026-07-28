@@ -76,6 +76,51 @@ Avoid:
 - 无法提取票号且任务需要 ticket 口径时，向用户确认。
 - 所有改动默认基于 ticket。
 
+### Workspace Isolation
+
+- Symphony 无人值守跑票时，工作目录是该票专属的 git worktree（`/Users/user/IdeaProjects/kyuyo-worktrees/<票号>`），与用户自己使用的
+  `/Users/user/IdeaProjects/kyuyo-backend` 共享同一份 Git 历史但互不干扰。
+- 只在自己的 worktree 内改文件、切分支、跑构建。禁止在 `/Users/user/IdeaProjects/kyuyo-backend` 内切分支、改文件、reset、stash 或删除；该目录只允许读取。
+- worktree 内不得 checkout `master`：`master` 由用户的检出占用，切换会直接失败。基线一律用 `origin/master`。
+- 票结束（Backlog 转入终态）后 Symphony 才回收 worktree；worktree 内还有未提交内容时保留不删。
+- 可能同时有多票各自在自己的 worktree 里并行推进。只操作自己这一票的 worktree 和分支，不读改其他票的 worktree，不共用临时文件路径。
+
+### Ticket Branch Preparation
+
+- 读取 Backlog 正文、评论、`issueType.name` 与全部 category 后，先准备票分支，再开始代码分析、系分编写或实现。
+- 当前分支名包含目标票号时，保留该分支及本地进度并继续。
+- 当前分支属于其他票时，工作区必须干净；发现未提交内容立即停止分支切换，先报告需要保留的文件。
+- 新票统一执行
+  `/Users/user/symphony/workflows/kyuyo-backend/scripts/prepare_ticket_branch.py`，`--repo` 传当前 worktree 路径。脚本拉取 `origin`，直接从 `origin/master` 创建票分支，不检出也不改写本地 `master`。
+- 分支格式固定为 `<scope>/<票号>-<Backlog完整票名>`。性质优先级固定为：Bug 使用 `fix`；CI、文档、設計書使用 `doc`；其余使用 `feat`。
+- 性质判断输入包含 Backlog 的 `issueType.name` 与全部 category。多个性质同时命中时按 `fix`、`doc`、`feat` 顺序选择。
+- 分支名处理规则：空白与 Git ref 非法字符转为 `-`，连续分隔符合并，合法 Unicode 字符保留，尾部 `.lock` 改写，UTF-8 component 超长时按完整字符安全截断。
+- 示例：`feat/KYUYO_NEW-4658-【backend】【Customer環境】給与計算エラー`。
+- 脚本返回 `created:` 时，继续前确认当前分支含目标票号，且 `HEAD` 等于 `origin/master`。脚本返回 `reuse:` 时，按已有票进度恢复。
+- `origin/master` 缺失、目标分支已被其他 worktree 检出、或 Git 命令失败时停止票实现，保留现场并报告具体失败。
+
+### Commit And Merge Request
+
+- 一票一个 commit。票分支上还没有自己的提交时创建提交；之后同一票的任何修改一律 `git commit --amend`，不追加第二个提交。
+- 提交前先看 `git log --oneline origin/master..HEAD`：0 个提交则新建，1 个提交则 amend，超过 1 个先压回 1 个再推。
+- commit message 必须包含票号。
+- 首次推送用 `git push -u origin HEAD`；amend 之后用 `git push --force-with-lease origin HEAD`。`--force-with-lease` 只允许用在本票分支，禁止裸 `--force`，禁止推 `master`。
+- 已经进入 `origin/master` 的提交禁止改写。
+- 分支推送后必须建 MR 到 `master` 供 review，这是完成票的必要步骤，不是可选项。
+- MR 标题固定由分支名推导：把分支名的第一个 `/` 换成全角 `：`，其余原样保留，不加不减不翻译。
+  例：分支 `fix/KYUYO_NEW-4658-【backend】【Customer環境】給与計算エラー` 对应标题
+  `fix：KYUYO_NEW-4658-【backend】【Customer環境】給与計算エラー`。
+- 建 MR 命令：
+  ```sh
+  branch="$(git branch --show-current)"
+  title="$(printf '%s' "$branch" | sed 's|/|：|')"
+  glab mr create --source-branch "$branch" --target-branch master --title "$title" --description '<摘要>' --yes
+  ```
+- 该分支已有开着的 MR 时复用它，不重复创建；amend 后的推送会自动更新 MR 内容。
+- 禁止自动合并 MR。
+- `glab` 未认证或建 MR 失败时，把具体失败原因作为阻断项报告，不得默默结束票。
+- 工作未做完也要把已验证的部分提交并推送，让 MR 反映当前状态，同时说明剩余项。
+
 ### Backlog Reading
 
 - 只要任务绑定 ticket，在分析、实现、review、测试方案判断前，必须先读取 Backlog 正文。
