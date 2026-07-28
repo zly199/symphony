@@ -107,13 +107,13 @@ Avoid:
 - 首次推送用 `git push -u origin HEAD`；amend 之后用 `git push --force-with-lease origin HEAD`。`--force-with-lease` 只允许用在本票分支，禁止裸 `--force`，禁止推 `master`。
 - 已经进入 `origin/master` 的提交禁止改写。
 - 分支推送后必须建 MR 到 `master` 供 review，这是完成票的必要步骤，不是可选项。
-- MR 标题固定由分支名推导：把分支名的第一个 `/` 换成全角 `：`，其余原样保留，不加不减不翻译。
+- MR 标题固定由分支名推导：把分支名的第一个 `/` 换成半角 `:`，其余原样保留，不加不减不翻译。
   例：分支 `fix/KYUYO_NEW-4658-【backend】【Customer環境】給与計算エラー` 对应标题
-  `fix：KYUYO_NEW-4658-【backend】【Customer環境】給与計算エラー`。
+  `fix:KYUYO_NEW-4658-【backend】【Customer環境】給与計算エラー`。
 - 建 MR 命令：
   ```sh
   branch="$(git branch --show-current)"
-  title="$(printf '%s' "$branch" | sed 's|/|：|')"
+  title="$(printf '%s' "$branch" | sed 's|/|:|')"
   glab mr create --source-branch "$branch" --target-branch master --title "$title" --description '<摘要>' --yes
   ```
 - 该分支已有开着的 MR 时复用它，不重复创建；amend 后的推送会自动更新 MR 内容。

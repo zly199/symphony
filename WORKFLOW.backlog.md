@@ -104,7 +104,7 @@ Operating rules:
     commit, and never rewrite commits that already exist on `origin/master`.
 16. A committed and pushed ticket branch must always have an open merge request targeting
     `master`. Creating that merge request is part of finishing the ticket, not an optional step.
-    Its title is the branch name with the first `/` replaced by a full-width `：`.
+    Its title is the branch name with the first `/` replaced by an ASCII `:`.
 
 Execution workflow:
 
@@ -149,14 +149,14 @@ Execution workflow:
 
     ```sh
     branch="$(git branch --show-current)"
-    title="$(printf '%s' "$branch" | sed 's|/|：|')"
+    title="$(printf '%s' "$branch" | sed 's|/|:|')"
     glab mr create --source-branch "$branch" --target-branch master \
       --title "$title" --description '<summary>' --yes
     ```
 
-    The title is the branch name with its first `/` replaced by a full-width `：`, for example
-    branch `fix/KYUYO_NEW-4658-【backend】【Customer環境】給与計算エラー` becomes title
-    `fix：KYUYO_NEW-4658-【backend】【Customer環境】給与計算エラー`. Nothing else is added, removed,
+    The title is the branch name with its first `/` replaced by an ASCII `:`, for example branch
+    `fix/KYUYO_NEW-4658-【backend】【Customer環境】給与計算エラー` becomes title
+    `fix:KYUYO_NEW-4658-【backend】【Customer環境】給与計算エラー`. Nothing else is added, removed,
     or translated.
 
     Reuse the existing merge request when one is already open for the branch; an amended push
