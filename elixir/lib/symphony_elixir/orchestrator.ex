@@ -40,7 +40,9 @@ defmodule SymphonyElixir.Orchestrator do
       blocked: %{},
       retry_attempts: %{},
       codex_totals: nil,
-      codex_rate_limits: nil
+      codex_rate_limits: nil,
+      tracker_issues: [],
+      tracker_synced_at: nil
     ]
   end
 
@@ -260,9 +262,18 @@ defmodule SymphonyElixir.Orchestrator do
       |> reconcile_blocked_issues()
 
     with :ok <- Config.validate!(),
-         {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states),
-         true <- available_slots(state) > 0 do
-      choose_issues(issues, state)
+         {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states) do
+      state = %{
+        state
+        | tracker_issues: issues,
+          tracker_synced_at: DateTime.utc_now()
+      }
+
+      if available_slots(state) > 0 do
+        choose_issues(issues, state)
+      else
+        state
+      end
     else
       {:error, :missing_linear_api_token} ->
         Logger.error("Tracker API token missing in WORKFLOW.md")
@@ -300,9 +311,6 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, reason} ->
         Logger.error("Failed to fetch from issue tracker: #{inspect(reason)}")
-        state
-
-      false ->
         state
     end
   end
@@ -1512,11 +1520,20 @@ defmodule SymphonyElixir.Orchestrator do
         }
       end)
 
+    tracker =
+      %{
+        source: Config.settings!().tracker.kind,
+        active_states: Config.settings!().tracker.active_states,
+        synced_at: state.tracker_synced_at,
+        issues: Enum.map(state.tracker_issues, &tracker_issue_snapshot/1)
+      }
+
     {:reply,
      %{
        running: running,
        retrying: retrying,
        blocked: blocked,
+       tracker: tracker,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
        polling: %{
@@ -1540,6 +1557,20 @@ defmodule SymphonyElixir.Orchestrator do
        requested_at: DateTime.utc_now(),
        operations: ["poll", "reconcile"]
      }, state}
+  end
+
+  defp tracker_issue_snapshot(%Issue{} = issue) do
+    %{
+      issue_id: issue.id,
+      identifier: issue.identifier,
+      title: issue.title,
+      state: issue.state,
+      issue_url: issue.url,
+      priority: issue.priority,
+      labels: issue.labels,
+      assignee_id: issue.assignee_id,
+      updated_at: issue.updated_at
+    }
   end
 
   defp blocked_issue_state(%{issue: %Issue{state: state}}), do: state

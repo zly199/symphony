@@ -11,13 +11,17 @@ defmodule SymphonyElixirWeb.Presenter do
 
     case Orchestrator.snapshot(orchestrator, snapshot_timeout_ms) do
       %{} = snapshot ->
+        tracker = tracker_payload(Map.get(snapshot, :tracker), snapshot)
+
         %{
           generated_at: generated_at,
           counts: %{
+            tracker_active: length(tracker.issues),
             running: length(snapshot.running),
             retrying: length(snapshot.retrying),
             blocked: length(Map.get(snapshot, :blocked, []))
           },
+          tracker: tracker,
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           blocked: Enum.map(Map.get(snapshot, :blocked, []), &blocked_entry_payload/1),
@@ -148,6 +152,53 @@ defmodule SymphonyElixirWeb.Presenter do
       last_event: entry.last_codex_event,
       last_message: summarize_message(entry.last_codex_message),
       last_event_at: iso8601(entry.last_codex_timestamp)
+    }
+  end
+
+  defp tracker_payload(tracker, snapshot) when is_map(tracker) do
+    runtime_statuses = tracker_runtime_statuses(snapshot)
+
+    %{
+      source: Map.get(tracker, :source),
+      active_states: Map.get(tracker, :active_states, []),
+      synced_at: iso8601(Map.get(tracker, :synced_at)),
+      issues:
+        tracker
+        |> Map.get(:issues, [])
+        |> Enum.map(&tracker_issue_payload(&1, runtime_statuses))
+    }
+  end
+
+  defp tracker_payload(_tracker, _snapshot) do
+    %{source: nil, active_states: [], synced_at: nil, issues: []}
+  end
+
+  defp tracker_runtime_statuses(snapshot) do
+    [
+      {Map.get(snapshot, :running, []), "running"},
+      {Map.get(snapshot, :retrying, []), "retrying"},
+      {Map.get(snapshot, :blocked, []), "blocked"}
+    ]
+    |> Enum.flat_map(fn {entries, status} ->
+      Enum.map(entries, &{Map.get(&1, :issue_id), status})
+    end)
+    |> Map.new()
+  end
+
+  defp tracker_issue_payload(issue, runtime_statuses) do
+    issue_id = Map.get(issue, :issue_id)
+
+    %{
+      issue_id: issue_id,
+      issue_identifier: Map.get(issue, :identifier),
+      title: Map.get(issue, :title),
+      state: Map.get(issue, :state),
+      issue_url: Map.get(issue, :issue_url),
+      priority: Map.get(issue, :priority),
+      labels: Map.get(issue, :labels, []),
+      assignee_id: Map.get(issue, :assignee_id),
+      updated_at: iso8601(Map.get(issue, :updated_at)),
+      runtime_status: Map.get(runtime_statuses, issue_id, "waiting")
     }
   end
 

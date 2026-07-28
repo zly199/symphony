@@ -80,6 +80,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
       <% else %>
         <section class="metric-grid">
           <article class="metric-card">
+            <p class="metric-label"><%= tracker_source_label(@payload.tracker.source) %> 当前票</p>
+            <p class="metric-value numeric"><%= @payload.counts.tracker_active %></p>
+            <p class="metric-detail">票源中符合活动状态的票数。</p>
+          </article>
+
+          <article class="metric-card">
             <p class="metric-label">运行中</p>
             <p class="metric-value numeric"><%= @payload.counts.running %></p>
             <p class="metric-detail">当前运行实例中的活跃问题会话数。</p>
@@ -110,6 +116,59 @@ defmodule SymphonyElixirWeb.DashboardLive do
             <p class="metric-value numeric"><%= format_runtime_seconds(total_runtime_seconds(@payload, @now)) %></p>
             <p class="metric-detail">已完成及活跃会话的 Codex 累计运行时长。</p>
           </article>
+        </section>
+
+        <section class="section-card">
+          <div class="section-header">
+            <div>
+              <h2 class="section-title"><%= tracker_source_label(@payload.tracker.source) %> 当前票</h2>
+              <p class="section-copy">
+                直接展示票源返回的活动票；工作区安全门仅控制代理调度。
+                <%= if @payload.tracker.synced_at do %>
+                  最近同步：<span class="mono numeric"><%= @payload.tracker.synced_at %></span>
+                <% end %>
+              </p>
+            </div>
+          </div>
+
+          <%= if @payload.tracker.issues == [] do %>
+            <p class="empty-state">票源当前没有符合活动状态的票。</p>
+          <% else %>
+            <div class="table-wrap">
+              <table class="data-table" style="min-width: 900px;">
+                <thead>
+                  <tr>
+                    <th>票号</th>
+                    <th>标题</th>
+                    <th>票状态</th>
+                    <th>代理状态</th>
+                    <th>分类</th>
+                    <th>更新时间</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr :for={entry <- @payload.tracker.issues}>
+                    <td>
+                      <.issue_identifier identifier={entry.issue_identifier} url={entry.issue_url} />
+                    </td>
+                    <td><%= entry.title || "暂无" %></td>
+                    <td>
+                      <span class={state_badge_class(entry.state)}>
+                        <%= entry.state || "暂无" %>
+                      </span>
+                    </td>
+                    <td>
+                      <span class={state_badge_class(entry.runtime_status)}>
+                        <%= runtime_status_label(entry.runtime_status) %>
+                      </span>
+                    </td>
+                    <td><%= format_labels(entry.labels) %></td>
+                    <td class="mono numeric"><%= entry.updated_at || "暂无" %></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          <% end %>
         </section>
 
         <section class="section-card">
@@ -430,12 +489,34 @@ defmodule SymphonyElixirWeb.DashboardLive do
     normalized = state |> to_string() |> String.downcase()
 
     cond do
-      String.contains?(normalized, ["progress", "running", "active"]) -> "#{base} state-badge-active"
-      String.contains?(normalized, ["blocked", "error", "failed"]) -> "#{base} state-badge-danger"
-      String.contains?(normalized, ["todo", "queued", "pending", "retry"]) -> "#{base} state-badge-warning"
-      true -> base
+      String.contains?(normalized, ["progress", "running", "active"]) ->
+        "#{base} state-badge-active"
+
+      String.contains?(normalized, ["blocked", "error", "failed"]) ->
+        "#{base} state-badge-danger"
+
+      String.contains?(normalized, ["todo", "queued", "pending", "retry", "waiting"]) ->
+        "#{base} state-badge-warning"
+
+      true ->
+        base
     end
   end
+
+  defp tracker_source_label("backlog"), do: "Backlog"
+  defp tracker_source_label("linear"), do: "Linear"
+  defp tracker_source_label("jira"), do: "Jira"
+  defp tracker_source_label("github"), do: "GitHub"
+  defp tracker_source_label("gitlab"), do: "GitLab"
+  defp tracker_source_label(_source), do: "票源"
+
+  defp runtime_status_label("running"), do: "运行中"
+  defp runtime_status_label("retrying"), do: "重试中"
+  defp runtime_status_label("blocked"), do: "已阻塞"
+  defp runtime_status_label(_status), do: "等待调度"
+
+  defp format_labels(labels) when is_list(labels) and labels != [], do: Enum.join(labels, "、")
+  defp format_labels(_labels), do: "暂无"
 
   defp schedule_runtime_tick do
     Process.send_after(self(), :runtime_tick, @runtime_tick_ms)

@@ -262,7 +262,34 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert state_payload == %{
              "generated_at" => state_payload["generated_at"],
-             "counts" => %{"running" => 1, "retrying" => 1, "blocked" => 1},
+             "counts" => %{
+               "tracker_active" => 1,
+               "running" => 1,
+               "retrying" => 1,
+               "blocked" => 1
+             },
+             "tracker" => %{
+               "source" => "backlog",
+               "active_states" => ["In Progress"],
+               "synced_at" => state_payload["tracker"]["synced_at"],
+               "issues" => [
+                 %{
+                   "issue_id" => "issue-tracked",
+                   "issue_identifier" => "MT-TRACKED",
+                   "title" => "Backlog tracked issue",
+                   "state" => "In Progress",
+                   "issue_url" => "https://example.org/issues/MT-TRACKED",
+                   "priority" => 3,
+                   "labels" => ["backend"],
+                   "assignee_id" => "user-1",
+                   "updated_at" =>
+                     state_payload["tracker"]["issues"]
+                     |> List.first()
+                     |> Map.fetch!("updated_at"),
+                   "runtime_status" => "waiting"
+                 }
+               ]
+             },
              "running" => [
                %{
                  "issue_id" => "issue-http",
@@ -503,6 +530,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     {:ok, view, html} = live(build_conn(), "/")
     assert html =~ "运行监控台"
     assert html =~ "MT-HTTP"
+    assert html =~ "MT-TRACKED"
     assert html =~ "MT-RETRY"
     assert html =~ "MT-BLOCKED"
     assert html =~ ~s(href="https://example.org/issues/MT-HTTP")
@@ -518,6 +546,9 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Codex 动态"
     assert html =~ "速率限制"
     assert html =~ "重试队列"
+    assert html =~ "Backlog 当前票"
+    assert html =~ "Backlog tracked issue"
+    assert html =~ "等待调度"
     refute html =~ "data-runtime-clock="
     refute html =~ "setInterval(refreshRuntimeClocks"
     refute html =~ "Refresh now"
@@ -614,7 +645,13 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     response = Req.get!("http://127.0.0.1:#{port}/api/v1/state")
     assert response.status == 200
-    assert response.body["counts"] == %{"running" => 1, "retrying" => 1, "blocked" => 1}
+
+    assert response.body["counts"] == %{
+             "tracker_active" => 1,
+             "running" => 1,
+             "retrying" => 1,
+             "blocked" => 1
+           }
 
     dashboard_css = Req.get!("http://127.0.0.1:#{port}/dashboard.css")
     assert dashboard_css.status == 200
@@ -658,6 +695,24 @@ defmodule SymphonyElixir.ExtensionsTest do
 
   defp static_snapshot do
     %{
+      tracker: %{
+        source: "backlog",
+        active_states: ["In Progress"],
+        synced_at: DateTime.utc_now(),
+        issues: [
+          %{
+            issue_id: "issue-tracked",
+            identifier: "MT-TRACKED",
+            title: "Backlog tracked issue",
+            state: "In Progress",
+            issue_url: "https://example.org/issues/MT-TRACKED",
+            priority: 3,
+            labels: ["backend"],
+            assignee_id: "user-1",
+            updated_at: DateTime.utc_now()
+          }
+        ]
+      },
       running: [
         %{
           issue_id: "issue-http",
