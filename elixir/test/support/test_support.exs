@@ -41,6 +41,10 @@ defmodule SymphonyElixir.TestSupport do
         write_workflow_file!(workflow_file)
         Workflow.set_workflow_file_path(workflow_file)
 
+        # Approvals are persisted, so each test needs its own store to stay
+        # independent of whatever an earlier test approved.
+        Application.put_env(:symphony_elixir, :state_dir, Path.join(workflow_root, "var"))
+
         if Process.whereis(SymphonyElixir.WorkflowStore),
           do: SymphonyElixir.WorkflowStore.force_reload()
 
@@ -50,6 +54,7 @@ defmodule SymphonyElixir.TestSupport do
           Application.delete_env(:symphony_elixir, :workflow_file_path)
           Application.delete_env(:symphony_elixir, :server_port_override)
           Application.delete_env(:symphony_elixir, :memory_tracker_issues)
+          Application.delete_env(:symphony_elixir, :state_dir)
           File.rm_rf(workflow_root)
         end)
 

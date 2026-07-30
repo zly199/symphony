@@ -5,7 +5,12 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{AnalysisFeedback, ApprovalStore, Config, PromptBuilder, ResumeState, Tracker, Workspace}
+
+  # Analysis is a bounded deliverable, so it gets far fewer turns than
+  # implementation. The cap also stops an unapproved ticket from spending a full
+  # run's budget before it reaches the operator.
+  @analysis_max_turns 3
   alias SymphonyElixir.Tracker.Issue
 
   @type worker_host :: String.t() | nil
@@ -86,10 +91,24 @@ defmodule SymphonyElixir.AgentRunner do
   defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
 
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
-    max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
+    phase = phase_for(issue)
+    configured_max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
+    max_turns = phase_max_turns(phase, configured_max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
 
+    opts =
+      opts
+      |> put_resume_state(workspace, issue)
+      |> put_review_feedback(issue)
+      |> Keyword.put(:phase, phase)
+
+    Logger.info("Running #{issue_context(issue)} in #{phase} phase with max_turns=#{max_turns}")
+
     with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
+      # The feedback is already in this run's opening prompt, so the session
+      # starting is the point where it counts as answered by a run.
+      mark_review_feedback_delivered(issue)
+
       try do
         do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
       after
@@ -152,6 +171,57 @@ defmodule SymphonyElixir.AgentRunner do
     - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
     """
   end
+
+  @doc """
+  Returns the phase a work item runs in: `:analysis` until an operator approves
+  it, `:implementation` afterwards.
+  """
+  @spec phase_for(Issue.t() | map()) :: :analysis | :implementation
+  def phase_for(%{id: issue_id}) do
+    if ApprovalStore.approved?(issue_id), do: :implementation, else: :analysis
+  end
+
+  def phase_for(_issue), do: :analysis
+
+  defp phase_max_turns(:analysis, configured), do: min(configured, @analysis_max_turns)
+  defp phase_max_turns(_phase, configured), do: configured
+
+  # A restarted orchestrator dispatches turn 1 again with no memory of prior
+  # runs, so the opening prompt carries the workspace's own account of what is
+  # already done.
+  defp put_resume_state(opts, workspace, issue) do
+    resume = ResumeState.inspect_workspace(workspace, issue)
+
+    if resume.started do
+      Logger.info(
+        "Resuming existing work for #{issue_context(issue)} branch=#{resume.branch} commits_ahead=#{resume.commits_ahead} dirty_files=#{resume.dirty_files} remote_synced=#{resume.remote_synced}"
+      )
+    end
+
+    Keyword.put(opts, :resume, resume)
+  end
+
+  # An operator who rejected the analysis wrote down what is wrong with it, and
+  # that text is the highest-priority input for the next run, so it travels in
+  # the opening prompt rather than waiting for a human to repeat it.
+  defp put_review_feedback(opts, %{id: issue_id}) when is_binary(issue_id) do
+    notes = AnalysisFeedback.notes(issue_id)
+    pending = Enum.count(notes, &is_nil(&1.delivered_at))
+
+    if notes != [] do
+      Logger.info("Carrying operator feedback into prompt issue_id=#{issue_id} notes=#{length(notes)} pending=#{pending}")
+    end
+
+    Keyword.put(opts, :feedback, notes)
+  end
+
+  defp put_review_feedback(opts, _issue), do: Keyword.put(opts, :feedback, [])
+
+  defp mark_review_feedback_delivered(%{id: issue_id}) when is_binary(issue_id) do
+    AnalysisFeedback.mark_delivered(issue_id)
+  end
+
+  defp mark_review_feedback_delivered(_issue), do: :ok
 
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
     case issue_state_fetcher.([issue_id]) do

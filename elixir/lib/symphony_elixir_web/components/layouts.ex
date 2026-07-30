@@ -54,6 +54,12 @@ defmodule SymphonyElixirWeb.Layouts do
   def app(assigns) do
     ~H"""
     <main class="app-shell">
+      <div :if={Phoenix.Flash.get(@flash, :info)} class="flash flash-info" phx-click="lv:clear-flash" phx-value-key="info">
+        {Phoenix.Flash.get(@flash, :info)}
+      </div>
+      <div :if={Phoenix.Flash.get(@flash, :error)} class="flash flash-error" phx-click="lv:clear-flash" phx-value-key="error">
+        {Phoenix.Flash.get(@flash, :error)}
+      </div>
       {@inner_content}
     </main>
     """

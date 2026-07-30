@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.CoreTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.{AnalysisFeedback, ApprovalStore}
+
   test "config defaults and validation checks" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
@@ -1041,6 +1043,8 @@ defmodule SymphonyElixir.CoreTest do
       started_at: DateTime.utc_now()
     }
 
+    {:ok, _record} = ApprovalStore.approve(issue_id)
+
     :sys.replace_state(pid, fn _ ->
       initial_state
       |> Map.put(:running, %{issue_id => running_entry})
@@ -1057,6 +1061,325 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
     assert_due_in_range(due_at_ms, 500, 1_100)
+  end
+
+  test "repeated continuations without tracker progress back off" do
+    issue_id = "issue-continuation-backoff"
+    orchestrator_name = Module.concat(__MODULE__, :ContinuationBackoffOrchestrator)
+    {:ok, pid} = start_continuation_orchestrator(orchestrator_name)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-570",
+      state: "In Progress",
+      updated_at: ~U[2026-07-27 09:01:30Z]
+    }
+
+    approve_and_run_continuation_turn(pid, issue_id, issue)
+    run_continuation_turn(pid, issue_id, issue)
+
+    state = :sys.get_state(pid)
+
+    assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
+    assert_due_in_range(due_at_ms, 1_500, 2_100)
+  end
+
+  test "continuations without tracker progress block the issue" do
+    issue_id = "issue-continuation-idle"
+    orchestrator_name = Module.concat(__MODULE__, :ContinuationIdleOrchestrator)
+    {:ok, pid} = start_continuation_orchestrator(orchestrator_name)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-571",
+      state: "In Progress",
+      updated_at: ~U[2026-07-27 09:01:30Z]
+    }
+
+    approve_and_run_continuation_turn(pid, issue_id, issue)
+    run_continuation_turn(pid, issue_id, issue)
+    run_continuation_turn(pid, issue_id, issue)
+
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    assert %{block_reason: :no_tracker_progress, error: error} = state.blocked[issue_id]
+    assert error =~ "without tracker progress"
+  end
+
+  test "tracker progress resets the idle continuation counter" do
+    issue_id = "issue-continuation-progress"
+    orchestrator_name = Module.concat(__MODULE__, :ContinuationProgressOrchestrator)
+    {:ok, pid} = start_continuation_orchestrator(orchestrator_name)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-572",
+      state: "In Progress",
+      updated_at: ~U[2026-07-27 09:01:30Z]
+    }
+
+    approve_and_run_continuation_turn(pid, issue_id, issue)
+    run_continuation_turn(pid, issue_id, issue)
+    run_continuation_turn(pid, issue_id, %{issue | updated_at: ~U[2026-07-28 05:00:00Z]})
+
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.blocked, issue_id)
+    assert Map.has_key?(state.retry_attempts, issue_id)
+    assert %{idle: 0, streak: 3} = state.continuations[issue_id]
+  end
+
+  defp start_continuation_orchestrator(orchestrator_name) do
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    {:ok, pid}
+  end
+
+  test "an unapproved issue parks for operator approval instead of continuing" do
+    issue_id = "issue-awaiting-approval"
+    orchestrator_name = Module.concat(__MODULE__, :ApprovalGateOrchestrator)
+    {:ok, pid} = start_continuation_orchestrator(orchestrator_name)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-980",
+      state: "In Progress",
+      updated_at: ~U[2026-07-27 09:01:30Z]
+    }
+
+    refute ApprovalStore.approved?(issue_id)
+    write_analysis_doc!("MT-980")
+    run_continuation_turn(pid, issue_id, issue)
+
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    assert %{block_reason: :awaiting_analysis_approval, error: error} = state.blocked[issue_id]
+    assert error =~ "waiting for operator approval"
+  end
+
+  test "a run that produced no analysis document is parked as incomplete" do
+    issue_id = "issue-analysis-missing"
+    orchestrator_name = Module.concat(__MODULE__, :AnalysisMissingOrchestrator)
+    {:ok, pid} = start_continuation_orchestrator(orchestrator_name)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-983",
+      state: "In Progress",
+      updated_at: ~U[2026-07-27 09:01:30Z]
+    }
+
+    refute SymphonyElixir.AnalysisDoc.exists?("MT-983")
+    run_continuation_turn(pid, issue_id, issue)
+
+    assert %{block_reason: :analysis_incomplete, error: error} =
+             :sys.get_state(pid).blocked[issue_id]
+
+    assert error =~ "without producing the analysis document"
+  end
+
+  defp write_analysis_doc!(identifier) do
+    {:ok, file} = SymphonyElixir.AnalysisDoc.doc_file(identifier)
+
+    File.mkdir_p!(Path.dirname(file))
+    File.write!(file, "<h1>#{identifier}</h1>")
+
+    on_exit(fn -> File.rm_rf(Path.dirname(file)) end)
+
+    file
+  end
+
+  test "approving an issue releases its block and records the decision" do
+    issue_id = "issue-approve-release"
+    orchestrator_name = Module.concat(__MODULE__, :ApproveReleaseOrchestrator)
+    {:ok, pid} = start_continuation_orchestrator(orchestrator_name)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-981",
+      state: "In Progress",
+      updated_at: ~U[2026-07-27 09:01:30Z]
+    }
+
+    write_analysis_doc!("MT-981")
+    run_continuation_turn(pid, issue_id, issue)
+    assert %{block_reason: :awaiting_analysis_approval} = :sys.get_state(pid).blocked[issue_id]
+
+    assert {:ok, record} =
+             Orchestrator.approve_analysis(pid, issue_id, identifier: "MT-981", approved_by: "tester")
+
+    assert record.identifier == "MT-981"
+    assert record.approved_by == "tester"
+
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.blocked, issue_id)
+    refute MapSet.member?(state.claimed, issue_id)
+    assert ApprovalStore.approved?(issue_id)
+    assert AgentRunner.phase_for(issue) == :implementation
+  end
+
+  test "operator feedback releases the block and sends the analysis back for another pass" do
+    issue_id = "issue-analysis-revision"
+    orchestrator_name = Module.concat(__MODULE__, :AnalysisRevisionOrchestrator)
+    {:ok, pid} = start_continuation_orchestrator(orchestrator_name)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-984",
+      state: "In Progress",
+      updated_at: ~U[2026-07-27 09:01:30Z]
+    }
+
+    write_analysis_doc!("MT-984")
+    run_continuation_turn(pid, issue_id, issue)
+    assert %{block_reason: :awaiting_analysis_approval} = :sys.get_state(pid).blocked[issue_id]
+
+    assert {:ok, note} =
+             Orchestrator.request_analysis_revision(pid, issue_id,
+               note: "  第 3 节缺少数据流  ",
+               identifier: "MT-984",
+               requested_by: "tester"
+             )
+
+    assert note.note == "第 3 节缺少数据流"
+    assert note.requested_by == "tester"
+
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.blocked, issue_id)
+    refute MapSet.member?(state.claimed, issue_id)
+    refute ApprovalStore.approved?(issue_id)
+    assert AgentRunner.phase_for(issue) == :analysis
+    assert AnalysisFeedback.pending?(issue_id)
+  end
+
+  test "feedback on an approved issue returns it to the analysis phase" do
+    issue_id = "issue-analysis-revision-approved"
+    orchestrator_name = Module.concat(__MODULE__, :AnalysisRevisionApprovedOrchestrator)
+    {:ok, pid} = start_continuation_orchestrator(orchestrator_name)
+
+    issue = %Issue{id: issue_id, identifier: "MT-985", state: "In Progress"}
+
+    {:ok, _record} = ApprovalStore.approve(issue_id, identifier: "MT-985")
+    assert AgentRunner.phase_for(issue) == :implementation
+
+    assert {:ok, _note} =
+             Orchestrator.request_analysis_revision(pid, issue_id,
+               note: "结论与代码不符",
+               identifier: "MT-985"
+             )
+
+    refute ApprovalStore.approved?(issue_id)
+    assert AgentRunner.phase_for(issue) == :analysis
+  end
+
+  test "blank feedback is rejected instead of re-running the analysis" do
+    issue_id = "issue-analysis-revision-blank"
+    orchestrator_name = Module.concat(__MODULE__, :AnalysisRevisionBlankOrchestrator)
+    {:ok, pid} = start_continuation_orchestrator(orchestrator_name)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-986",
+      state: "In Progress",
+      updated_at: ~U[2026-07-27 09:01:30Z]
+    }
+
+    write_analysis_doc!("MT-986")
+    run_continuation_turn(pid, issue_id, issue)
+
+    assert {:error, :empty_note} =
+             Orchestrator.request_analysis_revision(pid, issue_id, note: "   ", identifier: "MT-986")
+
+    assert {:error, :empty_note} =
+             Orchestrator.request_analysis_revision(pid, issue_id, identifier: "MT-986")
+
+    assert AnalysisFeedback.notes(issue_id) == []
+    assert %{block_reason: :awaiting_analysis_approval} = :sys.get_state(pid).blocked[issue_id]
+  end
+
+  test "delivered feedback stays as history while new feedback reads as pending" do
+    issue_id = "issue-analysis-feedback-delivery"
+
+    {:ok, _note} = AnalysisFeedback.add(issue_id, "补充异常分支", identifier: "MT-987")
+    assert AnalysisFeedback.pending?(issue_id)
+
+    :ok = AnalysisFeedback.mark_delivered(issue_id)
+
+    assert [%{note: "补充异常分支", delivered_at: delivered_at}] = AnalysisFeedback.notes(issue_id)
+    assert is_binary(delivered_at)
+    refute AnalysisFeedback.pending?(issue_id)
+
+    {:ok, _note} = AnalysisFeedback.add(issue_id, "回归用例不足", identifier: "MT-987")
+
+    assert [%{note: "补充异常分支"}, %{note: "回归用例不足"}] = AnalysisFeedback.notes(issue_id)
+    assert [%{note: "回归用例不足"}] = AnalysisFeedback.pending(issue_id)
+
+    :ok = AnalysisFeedback.clear(issue_id)
+    assert AnalysisFeedback.notes(issue_id) == []
+  end
+
+  test "tracker progress does not release an approval block" do
+    issue_id = "issue-approval-not-idle"
+    orchestrator_name = Module.concat(__MODULE__, :ApprovalNotIdleOrchestrator)
+    {:ok, pid} = start_continuation_orchestrator(orchestrator_name)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-982",
+      state: "In Progress",
+      updated_at: ~U[2026-07-27 09:01:30Z]
+    }
+
+    write_analysis_doc!("MT-982")
+    run_continuation_turn(pid, issue_id, issue)
+    blocked = :sys.get_state(pid).blocked[issue_id]
+
+    moved_issue = %{issue | updated_at: ~U[2026-07-28 05:00:00Z]}
+
+    assert %{block_reason: :awaiting_analysis_approval} = blocked
+    refute Orchestrator.idle_block_released_for_test?(blocked, moved_issue)
+  end
+
+  test "phase falls back to analysis for an unapproved issue" do
+    assert AgentRunner.phase_for(%Issue{id: "issue-unknown-phase"}) == :analysis
+  end
+
+  # The continuation loop only applies after an operator has approved the
+  # analysis; before that the orchestrator parks the issue instead.
+  defp approve_and_run_continuation_turn(pid, issue_id, issue) do
+    {:ok, _record} = ApprovalStore.approve(issue_id)
+    run_continuation_turn(pid, issue_id, issue)
+  end
+
+  defp run_continuation_turn(pid, issue_id, issue) do
+    ref = make_ref()
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: issue.identifier,
+      issue: issue,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn state ->
+      state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(state.claimed, issue_id))
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(50)
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
@@ -1255,10 +1578,15 @@ defmodule SymphonyElixir.CoreTest do
     assert Orchestrator.select_worker_host_for_test(state, "worker-a") == "worker-a"
   end
 
+  # Time passes between scheduling the timer and reading it back, so the lower
+  # bound gets slack for orchestrator work and scheduler noise. The window still
+  # pins the delay's magnitude, which is what these assertions are checking.
+  @due_measurement_slack_ms 600
+
   defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do
     remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
 
-    assert remaining_ms >= min_remaining_ms
+    assert remaining_ms >= min_remaining_ms - @due_measurement_slack_ms
     assert remaining_ms <= max_remaining_ms
   end
 

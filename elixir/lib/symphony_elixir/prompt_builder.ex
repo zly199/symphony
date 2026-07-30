@@ -3,7 +3,7 @@ defmodule SymphonyElixir.PromptBuilder do
   Builds agent prompts from normalized tracker work item data.
   """
 
-  alias SymphonyElixir.{Config, Workflow}
+  alias SymphonyElixir.{Config, ResumeState, Workflow}
 
   @render_opts [strict_variables: true, strict_filters: true]
 
@@ -18,6 +18,9 @@ defmodule SymphonyElixir.PromptBuilder do
     |> Solid.render!(
       %{
         "attempt" => Keyword.get(opts, :attempt),
+        "phase" => opts |> Keyword.get(:phase, :analysis) |> to_string(),
+        "resume" => opts |> Keyword.get(:resume, ResumeState.empty()) |> to_solid_map(),
+        "feedback" => opts |> Keyword.get(:feedback, []) |> to_feedback(),
         "issue" => issue |> Map.from_struct() |> to_solid_map()
       },
       @render_opts
@@ -39,6 +42,27 @@ defmodule SymphonyElixir.PromptBuilder do
                 message: "template_parse_error: #{Exception.message(error)} template=#{inspect(prompt)}"
               },
               __STACKTRACE__
+  end
+
+  # Templates need a count they can branch on: a Liquid `{% if %}` treats an
+  # empty list as true, so the list alone cannot gate the feedback section.
+  defp to_feedback(notes) when is_list(notes) do
+    %{
+      "count" => length(notes),
+      "pending_count" => Enum.count(notes, &is_nil(Map.get(&1, :delivered_at))),
+      "notes" => Enum.map(notes, &feedback_note/1)
+    }
+  end
+
+  defp to_feedback(_notes), do: to_feedback([])
+
+  defp feedback_note(note) when is_map(note) do
+    %{
+      "note" => Map.get(note, :note),
+      "requested_at" => Map.get(note, :requested_at),
+      "requested_by" => Map.get(note, :requested_by),
+      "delivered" => not is_nil(Map.get(note, :delivered_at))
+    }
   end
 
   defp to_solid_map(map) when is_map(map) do

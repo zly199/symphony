@@ -3,7 +3,7 @@ defmodule SymphonyElixirWeb.Presenter do
   Shared projections for the observability API and dashboard.
   """
 
-  alias SymphonyElixir.{Config, Orchestrator, StatusDashboard, Workspace}
+  alias SymphonyElixir.{AnalysisFeedback, Config, Orchestrator, StatusDashboard, Workspace}
 
   @spec state_payload(GenServer.name(), timeout()) :: map()
   def state_payload(orchestrator, snapshot_timeout_ms) do
@@ -115,6 +115,7 @@ defmodule SymphonyElixirWeb.Presenter do
       turn_count: Map.get(entry, :turn_count, 0),
       last_event: entry.last_codex_event,
       last_message: summarize_message(entry.last_codex_message),
+      recent_events: recent_events_payload(entry),
       started_at: iso8601(entry.started_at),
       last_event_at: iso8601(entry.last_codex_timestamp),
       tokens: %{
@@ -145,14 +146,32 @@ defmodule SymphonyElixirWeb.Presenter do
       issue_url: Map.get(entry, :issue_url),
       state: entry.state,
       error: entry.error,
+      block_reason: Map.get(entry, :block_reason, :input_required),
+      analysis_feedback: analysis_feedback_payload(entry.issue_id),
       worker_host: Map.get(entry, :worker_host),
       workspace_path: Map.get(entry, :workspace_path),
       session_id: entry.session_id,
       blocked_at: iso8601(entry.blocked_at),
       last_event: entry.last_codex_event,
       last_message: summarize_message(entry.last_codex_message),
+      recent_events: recent_events_payload(entry),
       last_event_at: iso8601(entry.last_codex_timestamp)
     }
+  end
+
+  # Feedback the operator already sent is what tells them whether their last
+  # correction reached a run, so it travels with the blocked entry itself.
+  defp analysis_feedback_payload(issue_id) do
+    issue_id
+    |> AnalysisFeedback.notes()
+    |> Enum.map(fn note ->
+      %{
+        note: note.note,
+        requested_at: note.requested_at,
+        requested_by: note.requested_by,
+        delivered: not is_nil(note.delivered_at)
+      }
+    end)
   end
 
   defp tracker_payload(tracker, snapshot) when is_map(tracker) do
@@ -261,14 +280,28 @@ defmodule SymphonyElixirWeb.Presenter do
   defp recent_events_payload(nil), do: []
 
   defp recent_events_payload(entry) do
-    [
-      %{
-        at: iso8601(entry.last_codex_timestamp),
-        event: entry.last_codex_event,
-        message: summarize_message(entry.last_codex_message)
-      }
-    ]
-    |> Enum.reject(&is_nil(&1.at))
+    case Map.get(entry, :codex_activity, []) do
+      [] ->
+        # This list drives the dashboard's activity column, so a message with no
+        # timestamp is still worth showing.
+        [
+          %{
+            at: iso8601(entry.last_codex_timestamp),
+            event: entry.last_codex_event,
+            message: summarize_message(entry.last_codex_message)
+          }
+        ]
+        |> Enum.reject(&(is_nil(&1.at) and is_nil(&1.message) and is_nil(&1.event)))
+
+      activity ->
+        Enum.map(activity, fn event ->
+          %{
+            at: iso8601(Map.get(event, :at)),
+            event: Map.get(event, :event),
+            message: Map.get(event, :message)
+          }
+        end)
+    end
   end
 
   defp summarize_message(nil), do: nil

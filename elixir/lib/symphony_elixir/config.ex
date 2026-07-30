@@ -105,6 +105,14 @@ defmodule SymphonyElixir.Config do
     end
   end
 
+  @doc """
+  Returns the directory holding orchestrator state that must outlive a restart.
+  """
+  @spec state_dir() :: Path.t()
+  def state_dir do
+    Application.get_env(:symphony_elixir, :state_dir) || Path.join(workflow_dir(), "var")
+  end
+
   defp workflow_dir do
     Workflow.workflow_file_path() |> Path.expand() |> Path.dirname()
   end

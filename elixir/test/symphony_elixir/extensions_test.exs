@@ -4,6 +4,7 @@ defmodule SymphonyElixir.ExtensionsTest do
   import Phoenix.ConnTest
   import Phoenix.LiveViewTest
 
+  alias SymphonyElixir.AnalysisFeedback
   alias SymphonyElixir.Linear.Adapter
   alias SymphonyElixir.Tracker.Memory
 
@@ -302,6 +303,9 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "turn_count" => 7,
                  "last_event" => "notification",
                  "last_message" => "rendered",
+                 "recent_events" => [
+                   %{"at" => nil, "event" => "notification", "message" => "rendered"}
+                 ],
                  "started_at" => state_payload["running"] |> List.first() |> Map.fetch!("started_at"),
                  "last_event_at" => nil,
                  "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
@@ -326,12 +330,21 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "issue_url" => "https://example.org/issues/MT-BLOCKED",
                  "state" => "In Progress",
                  "error" => "codex turn requires operator input",
+                 "block_reason" => "input_required",
+                 "analysis_feedback" => [],
                  "worker_host" => "dm-dev2",
                  "workspace_path" => "/workspaces/MT-BLOCKED",
                  "session_id" => "thread-blocked",
                  "blocked_at" => state_payload["blocked"] |> List.first() |> Map.fetch!("blocked_at"),
                  "last_event" => "turn_input_required",
                  "last_message" => "turn blocked: waiting for user input",
+                 "recent_events" => [
+                   %{
+                     "at" => state_payload["blocked"] |> List.first() |> Map.fetch!("last_event_at"),
+                     "event" => "turn_input_required",
+                     "message" => "turn blocked: waiting for user input"
+                   }
+                 ],
                  "last_event_at" => state_payload["blocked"] |> List.first() |> Map.fetch!("last_event_at")
                }
              ],
@@ -371,7 +384,9 @@ defmodule SymphonyElixir.ExtensionsTest do
              "retry" => nil,
              "blocked" => nil,
              "logs" => %{"codex_session_logs" => []},
-             "recent_events" => [],
+             "recent_events" => [
+               %{"at" => nil, "event" => "notification", "message" => "rendered"}
+             ],
              "last_error" => nil,
              "tracked" => %{}
            }
@@ -600,6 +615,46 @@ defmodule SymphonyElixir.ExtensionsTest do
     refute render(view) =~ "javascript:alert"
   end
 
+  test "dashboard liveview offers both answers at the analysis gate" do
+    orchestrator_name = Module.concat(__MODULE__, :AnalysisGateDashboardOrchestrator)
+    snapshot = static_snapshot()
+
+    gated_snapshot =
+      put_in(snapshot.blocked, [
+        snapshot.blocked
+        |> List.first()
+        |> Map.merge(%{
+          error: "analysis complete; waiting for operator approval before implementation",
+          block_reason: :awaiting_analysis_approval
+        })
+      ])
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(name: orchestrator_name, snapshot: gated_snapshot)
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    {:ok, view, html} = live(build_conn(), "/")
+
+    assert html =~ "批准继续"
+    assert html =~ "打回修改"
+    assert html =~ ~s(name="note")
+
+    html = submit_revision(view, "第 3 节缺少数据流")
+
+    assert html =~ "已记录 MT-BLOCKED 的修改意见"
+    assert [%{note: "第 3 节缺少数据流", identifier: "MT-BLOCKED"}] = AnalysisFeedback.notes("issue-blocked")
+
+    assert submit_revision(view, "   ") =~ "请先填写需要修改的内容"
+    assert length(AnalysisFeedback.notes("issue-blocked")) == 1
+  end
+
+  defp submit_revision(view, note) do
+    view
+    |> element("form.revision-form")
+    |> render_submit(%{"issue-id" => "issue-blocked", "identifier" => "MT-BLOCKED", "note" => note})
+  end
+
   test "dashboard liveview renders an unavailable state without crashing" do
     start_test_endpoint(
       orchestrator: Module.concat(__MODULE__, :MissingDashboardOrchestrator),
@@ -795,6 +850,88 @@ defmodule SymphonyElixir.ExtensionsTest do
         {:ok, _pid} -> :ok
         {:error, {:already_started, _pid}} -> :ok
       end
+    end
+  end
+
+  describe "analysis document route" do
+    setup do
+      identifier = "MT-DOC"
+      workspace = Path.join(Config.local_workspace_root(), Workspace.workspace_key(identifier))
+      docs_root = Path.join(workspace, "ai-workspace/docs")
+
+      # Assets live only in the source repository, mirroring a real worktree
+      # whose checked-out commit predates them.
+      repository = Path.join(System.tmp_dir!(), "symphony-elixir-doc-repo-#{System.unique_integer([:positive])}")
+      repository_docs = Path.join(repository, "ai-workspace/docs")
+
+      File.mkdir_p!(Path.join(repository_docs, "assets"))
+      File.write!(Path.join(repository_docs, "assets/docs.css"), ".diagram-caption { color: red; }")
+      File.write!(Path.join(repository, "repo-secret.txt"), "must not be served")
+
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_repository: repository)
+
+      File.mkdir_p!(Path.join(docs_root, "tickets/#{identifier}"))
+      File.write!(Path.join(docs_root, "tickets/#{identifier}/index.html"), "<h1>系分 MT-DOC</h1>")
+      File.write!(Path.join(workspace, "secret.txt"), "must not be served")
+
+      start_test_endpoint([])
+
+      on_exit(fn ->
+        File.rm_rf(workspace)
+        File.rm_rf(repository)
+      end)
+
+      %{identifier: identifier, workspace: workspace, repository: repository}
+    end
+
+    test "serves the analysis document and its relative assets", %{identifier: identifier} do
+      conn = get(build_conn(), "/analysis/#{identifier}/tickets/#{identifier}/index.html")
+
+      assert response(conn, 200) =~ "系分 MT-DOC"
+      assert response_content_type(conn, :html) =~ "text/html"
+
+      # The document links its stylesheet as ../../assets/docs.css, which
+      # resolves under the same prefix and falls back to the source repository.
+      css_conn = get(build_conn(), "/analysis/#{identifier}/assets/docs.css")
+
+      assert response(css_conn, 200) =~ "diagram-caption"
+      assert response_content_type(css_conn, :css) =~ "text/css"
+    end
+
+    test "the repository fallback cannot serve files outside its docs tree", %{
+      identifier: identifier
+    } do
+      conn = get(build_conn(), "/analysis/#{identifier}/../repo-secret.txt")
+
+      assert response(conn, 404)
+    end
+
+    test "redirects the bare identifier to the document", %{identifier: identifier} do
+      conn = get(build_conn(), "/analysis/#{identifier}")
+
+      assert redirected_to(conn) == "/analysis/#{identifier}/tickets/#{identifier}/index.html"
+    end
+
+    test "refuses to escape the docs tree", %{identifier: identifier} do
+      conn = get(build_conn(), "/analysis/#{identifier}/../../secret.txt")
+
+      assert response(conn, 404)
+
+      escaped = get(build_conn(), "/analysis/#{identifier}/tickets/../../../secret.txt")
+
+      assert response(escaped, 404)
+    end
+
+    test "returns 404 for an unknown work item" do
+      conn = get(build_conn(), "/analysis/MT-NOPE/tickets/MT-NOPE/index.html")
+
+      assert response(conn, 404)
+    end
+
+    test "doc_exists? reports only real documents", %{identifier: identifier} do
+      assert SymphonyElixirWeb.AnalysisDocController.doc_exists?(identifier)
+      refute SymphonyElixirWeb.AnalysisDocController.doc_exists?("MT-NOPE")
+      refute SymphonyElixirWeb.AnalysisDocController.doc_exists?(nil)
     end
   end
 end

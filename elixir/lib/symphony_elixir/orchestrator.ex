@@ -7,11 +7,35 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{
+    AgentRunner,
+    AnalysisDoc,
+    AnalysisFeedback,
+    ApprovalStore,
+    Config,
+    StatusDashboard,
+    Tracker,
+    Workspace
+  }
+
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
+  # Consecutive continuation runs without tracker progress before the issue is
+  # treated as waiting on an operator instead of being dispatched again.
+  @max_idle_continuations 3
+  # Per-issue ring of recent Codex activity kept for the dashboard.
+  @codex_activity_limit 25
+  # Bookkeeping traffic that says nothing about what the agent is doing. Keeping
+  # it out of the activity log is what makes the log readable.
+  @codex_activity_noise_methods [
+    "account/rateLimits/updated",
+    "account/updated",
+    "account/chatgptAuthTokens/refresh",
+    "thread/tokenUsage/updated",
+    "item/reasoning/summaryPartAdded"
+  ]
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -39,6 +63,7 @@ defmodule SymphonyElixir.Orchestrator do
       claimed: MapSet.new(),
       blocked: %{},
       retry_attempts: %{},
+      continuations: %{},
       codex_totals: nil,
       codex_rate_limits: nil,
       tracker_issues: [],
@@ -208,20 +233,15 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_agent_down(:normal, state, issue_id, running_entry, session_id) do
-    if input_required_blocker?(running_entry) do
-      block_input_required_agent_down(state, issue_id, running_entry, session_id, :normal)
-    else
-      Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+    cond do
+      input_required_blocker?(running_entry) ->
+        block_input_required_agent_down(state, issue_id, running_entry, session_id, :normal)
 
-      state
-      |> complete_issue(issue_id)
-      |> schedule_issue_retry(issue_id, 1, %{
-        identifier: running_entry.identifier,
-        issue_url: running_entry.issue.url,
-        delay_type: :continuation,
-        worker_host: Map.get(running_entry, :worker_host),
-        workspace_path: Map.get(running_entry, :workspace_path)
-      })
+      not ApprovalStore.approved?(issue_id) ->
+        block_awaiting_approval_agent_down(state, issue_id, running_entry, session_id)
+
+      true ->
+        continue_or_block_agent_down(state, issue_id, running_entry, session_id)
     end
   end
 
@@ -232,6 +252,108 @@ defmodule SymphonyElixir.Orchestrator do
       retry_agent_down(state, issue_id, running_entry, session_id, reason)
     end
   end
+
+  # The analysis phase ends at an operator decision, not at a tracker state
+  # change, so the item parks here until the dashboard approves it. Approval is
+  # only offered once the deliverable actually exists; a run that ended without
+  # producing the document is parked as incomplete instead, so the operator is
+  # never asked to approve something that was never written.
+  defp block_awaiting_approval_agent_down(state, issue_id, running_entry, session_id) do
+    identifier = running_entry.identifier
+
+    {error, reason} =
+      if AnalysisDoc.exists?(identifier) do
+        {"analysis complete; waiting for operator approval before implementation", :awaiting_analysis_approval}
+      else
+        {"analysis run ended without producing the analysis document", :analysis_incomplete}
+      end
+
+    Logger.info("Issue blocked before implementation: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} reason=#{reason}")
+
+    block_issue_from_entry(state, issue_id, running_entry, error, reason)
+  end
+
+  defp continue_or_block_agent_down(state, issue_id, running_entry, session_id) do
+    continuation = bump_continuation(state, issue_id, running_entry)
+
+    if continuation.idle >= @max_idle_continuations do
+      block_idle_continuation_agent_down(state, issue_id, running_entry, session_id, continuation)
+    else
+      Logger.info(
+        "Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check (streak #{continuation.streak}, idle #{continuation.idle}/#{@max_idle_continuations})"
+      )
+
+      state
+      |> put_continuation(issue_id, continuation)
+      |> complete_issue(issue_id)
+      |> schedule_issue_retry(issue_id, 1, %{
+        identifier: running_entry.identifier,
+        issue_url: running_entry.issue.url,
+        delay_type: :continuation,
+        continuation_streak: continuation.streak,
+        worker_host: Map.get(running_entry, :worker_host),
+        workspace_path: Map.get(running_entry, :workspace_path)
+      })
+    end
+  end
+
+  defp block_idle_continuation_agent_down(state, issue_id, running_entry, session_id, continuation) do
+    error =
+      "agent completed #{continuation.idle} consecutive runs without tracker progress; waiting for operator action"
+
+    Logger.warning("Issue blocked: issue_id=#{issue_id} issue_identifier=#{running_entry.identifier} session_id=#{session_id}; #{error}")
+
+    state
+    |> put_continuation(issue_id, continuation)
+    |> block_issue_from_entry(issue_id, running_entry, error, :no_tracker_progress)
+  end
+
+  # Continuation bookkeeping. `streak` counts every consecutive continuation run
+  # and drives the reschedule backoff; `idle` counts only the runs that left the
+  # tracker item untouched and drives the operator block.
+  defp bump_continuation(%State{} = state, issue_id, running_entry) do
+    previous = Map.get(state.continuations, issue_id, %{streak: 0, idle: 0, updated_at: nil})
+    updated_at = running_entry |> Map.get(:issue) |> issue_updated_at()
+
+    idle =
+      if tracker_progressed?(Map.get(previous, :updated_at), updated_at) do
+        0
+      else
+        Map.get(previous, :idle, 0) + 1
+      end
+
+    %{streak: Map.get(previous, :streak, 0) + 1, idle: idle, updated_at: updated_at}
+  end
+
+  defp put_continuation(%State{} = state, issue_id, continuation) do
+    %{state | continuations: Map.put(state.continuations, issue_id, continuation)}
+  end
+
+  defp issue_updated_at(%Issue{updated_at: updated_at}), do: updated_at
+  defp issue_updated_at(_issue), do: nil
+
+  # A first observation carries no baseline, so it never counts as progress.
+  defp tracker_progressed?(nil, _current), do: false
+  defp tracker_progressed?(_previous, nil), do: false
+
+  defp tracker_progressed?(%DateTime{} = previous, %DateTime{} = current) do
+    DateTime.compare(current, previous) == :gt
+  end
+
+  defp tracker_progressed?(previous, current), do: previous != current
+
+  # An issue parked for lack of progress resumes as soon as the tracker item
+  # actually moves; operator-input blocks stay put until the state changes.
+  defp idle_block_released?(%{block_reason: :no_tracker_progress} = blocked_entry, %Issue{} = issue) do
+    tracker_progressed?(Map.get(blocked_entry, :blocked_updated_at), issue.updated_at)
+  end
+
+  defp idle_block_released?(_blocked_entry, _issue), do: false
+
+  @doc false
+  @spec idle_block_released_for_test?(map(), Issue.t()) :: boolean()
+  def idle_block_released_for_test?(blocked_entry, %Issue{} = issue),
+    do: idle_block_released?(blocked_entry, issue)
 
   defp block_input_required_agent_down(state, issue_id, running_entry, session_id, reason) do
     error = blocker_error(running_entry, "agent exited: #{inspect(reason)}")
@@ -490,7 +612,13 @@ defmodule SymphonyElixir.Orchestrator do
         release_issue_claim(state, issue.id)
 
       active_issue_state?(issue.state, active_states) ->
-        refresh_blocked_issue_state(state, issue)
+        if idle_block_released?(Map.get(state.blocked, issue.id), issue) do
+          Logger.info("Blocked issue saw tracker progress: #{issue_context(issue)} updated_at=#{inspect(issue.updated_at)}; releasing block")
+
+          release_issue_claim(state, issue.id)
+        else
+          refresh_blocked_issue_state(state, issue)
+        end
 
       true ->
         Logger.info("Blocked issue moved to non-active state: #{issue_context(issue)} state=#{issue.state}; releasing block")
@@ -597,7 +725,8 @@ defmodule SymphonyElixir.Orchestrator do
           | running: Map.delete(state.running, issue_id),
             claimed: MapSet.delete(state.claimed, issue_id),
             blocked: Map.delete(state.blocked, issue_id),
-            retry_attempts: Map.delete(state.retry_attempts, issue_id)
+            retry_attempts: Map.delete(state.retry_attempts, issue_id),
+            continuations: Map.delete(state.continuations, issue_id)
         }
 
       _ ->
@@ -790,19 +919,24 @@ defmodule SymphonyElixir.Orchestrator do
     block_issue_from_entry(state, issue_id, running_entry, error)
   end
 
-  defp block_issue_from_entry(%State{} = state, issue_id, running_entry, error) do
+  defp block_issue_from_entry(%State{} = state, issue_id, running_entry, error, reason \\ :input_required) do
+    issue = Map.get(running_entry, :issue)
+
     blocked_entry = %{
       issue_id: issue_id,
       identifier: Map.get(running_entry, :identifier, issue_id),
-      issue: Map.get(running_entry, :issue),
+      issue: issue,
       worker_host: Map.get(running_entry, :worker_host),
       workspace_path: Map.get(running_entry, :workspace_path),
       session_id: running_entry_session_id(running_entry),
       error: error,
+      block_reason: reason,
+      blocked_updated_at: issue_updated_at(issue),
       blocked_at: DateTime.utc_now(),
       last_codex_message: Map.get(running_entry, :last_codex_message),
       last_codex_event: Map.get(running_entry, :last_codex_event),
-      last_codex_timestamp: Map.get(running_entry, :last_codex_timestamp)
+      last_codex_timestamp: Map.get(running_entry, :last_codex_timestamp),
+      codex_activity: Map.get(running_entry, :codex_activity, [])
     }
 
     %{
@@ -1015,6 +1149,7 @@ defmodule SymphonyElixir.Orchestrator do
             last_codex_message: nil,
             last_codex_timestamp: nil,
             last_codex_event: nil,
+            codex_activity: [],
             codex_app_server_pid: nil,
             codex_input_tokens: 0,
             codex_output_tokens: 0,
@@ -1265,23 +1400,54 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  # Feedback normally arrives while the item sits at the approval gate, and
+  # dropping the claim is what lets the next poll dispatch it again. An item that
+  # is still running keeps its claim: the running agent owns it, and it will pick
+  # the feedback up on its next dispatch anyway.
+  defp release_for_revision(%State{} = state, issue_id) do
+    state =
+      if Map.has_key?(state.running, issue_id) do
+        Logger.info("Analysis feedback recorded while the agent is running issue_id=#{issue_id}; the next dispatch carries it")
+
+        state
+      else
+        release_issue_claim(state, issue_id)
+      end
+
+    notify_dashboard()
+
+    state
+  end
+
   defp release_issue_claim(%State{} = state, issue_id) do
     %{
       state
       | claimed: MapSet.delete(state.claimed, issue_id),
         blocked: Map.delete(state.blocked, issue_id),
-        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+        retry_attempts: Map.delete(state.retry_attempts, issue_id),
+        continuations: Map.delete(state.continuations, issue_id)
     }
   end
 
   defp retry_delay(attempt, metadata)
        when is_integer(attempt) and attempt > 0 and is_map(metadata) do
     if metadata[:delay_type] == :continuation and attempt == 1 do
-      @continuation_retry_delay_ms
+      continuation_retry_delay(metadata[:continuation_streak])
     else
       failure_retry_delay(attempt)
     end
   end
+
+  defp continuation_retry_delay(streak) when is_integer(streak) and streak > 0 do
+    max_delay_power = min(streak - 1, 10)
+
+    min(
+      @continuation_retry_delay_ms * (1 <<< max_delay_power),
+      Config.settings!().agent.max_retry_backoff_ms
+    )
+  end
+
+  defp continuation_retry_delay(_streak), do: @continuation_retry_delay_ms
 
   defp failure_retry_delay(attempt) do
     max_delay_power = min(attempt - 1, 10)
@@ -1425,6 +1591,47 @@ defmodule SymphonyElixir.Orchestrator do
     )
   end
 
+  @doc """
+  Records operator approval for `issue_id` and releases its approval block so
+  the next dispatch runs in the implementation phase.
+  """
+  @spec approve_analysis(String.t(), keyword()) :: {:ok, map()} | {:error, term()} | :unavailable
+  def approve_analysis(issue_id, opts \\ []), do: approve_analysis(__MODULE__, issue_id, opts)
+
+  @spec approve_analysis(GenServer.server(), String.t(), keyword()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def approve_analysis(server, issue_id, opts) when is_binary(issue_id) do
+    if is_pid(server) or Process.whereis(server) do
+      GenServer.call(server, {:approve_analysis, issue_id, opts})
+    else
+      :unavailable
+    end
+  end
+
+  @doc """
+  Records operator feedback on `issue_id`'s analysis and sends it back for
+  another analysis pass.
+
+  This is the counterpart to `approve_analysis/3`: the operator states what is
+  wrong instead of accepting the document. Any earlier approval is withdrawn, so
+  the item re-runs analysis with the feedback in its prompt rather than moving on
+  to implementation.
+  """
+  @spec request_analysis_revision(String.t(), keyword()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def request_analysis_revision(issue_id, opts \\ []),
+    do: request_analysis_revision(__MODULE__, issue_id, opts)
+
+  @spec request_analysis_revision(GenServer.server(), String.t(), keyword()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def request_analysis_revision(server, issue_id, opts) when is_binary(issue_id) do
+    if is_pid(server) or Process.whereis(server) do
+      GenServer.call(server, {:request_analysis_revision, issue_id, opts})
+    else
+      :unavailable
+    end
+  end
+
   @spec request_refresh() :: map() | :unavailable
   def request_refresh do
     request_refresh(__MODULE__)
@@ -1482,6 +1689,7 @@ defmodule SymphonyElixir.Orchestrator do
           last_codex_timestamp: metadata.last_codex_timestamp,
           last_codex_message: metadata.last_codex_message,
           last_codex_event: metadata.last_codex_event,
+          codex_activity: Map.get(metadata, :codex_activity, []),
           runtime_seconds: running_seconds(metadata.started_at, now)
         }
       end)
@@ -1513,10 +1721,12 @@ defmodule SymphonyElixir.Orchestrator do
           workspace_path: Map.get(metadata, :workspace_path),
           session_id: Map.get(metadata, :session_id),
           error: Map.get(metadata, :error),
+          block_reason: Map.get(metadata, :block_reason, :input_required),
           blocked_at: Map.get(metadata, :blocked_at),
           last_codex_timestamp: Map.get(metadata, :last_codex_timestamp),
           last_codex_message: Map.get(metadata, :last_codex_message),
-          last_codex_event: Map.get(metadata, :last_codex_event)
+          last_codex_event: Map.get(metadata, :last_codex_event),
+          codex_activity: Map.get(metadata, :codex_activity, [])
         }
       end)
 
@@ -1542,6 +1752,39 @@ defmodule SymphonyElixir.Orchestrator do
          poll_interval_ms: state.poll_interval_ms
        }
      }, state}
+  end
+
+  def handle_call({:approve_analysis, issue_id, opts}, _from, state) do
+    case ApprovalStore.approve(issue_id, opts) do
+      {:ok, record} ->
+        Logger.info("Releasing approval block issue_id=#{issue_id}; next dispatch runs in implementation phase")
+
+        # Dropping the claim lets the next poll pick the item up again, this
+        # time with the approval on record.
+        state = release_issue_claim(state, issue_id)
+        notify_dashboard()
+
+        {:reply, {:ok, record}, state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call({:request_analysis_revision, issue_id, opts}, _from, state) do
+    case AnalysisFeedback.add(issue_id, Keyword.get(opts, :note), opts) do
+      {:ok, note} ->
+        # Feedback rejects the current analysis, so an approval recorded earlier no
+        # longer holds; the item owes another analysis pass before implementation.
+        _ = ApprovalStore.revoke(issue_id)
+
+        Logger.info("Recorded analysis revision request issue_id=#{issue_id} identifier=#{inspect(note.identifier)}; next dispatch re-runs analysis")
+
+        {:reply, {:ok, note}, release_for_revision(state, issue_id)}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
   end
 
   def handle_call(:request_refresh, _from, state) do
@@ -1603,10 +1846,45 @@ defmodule SymphonyElixir.Orchestrator do
         codex_last_reported_input_tokens: max(last_reported_input, token_delta.input_reported),
         codex_last_reported_output_tokens: max(last_reported_output, token_delta.output_reported),
         codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
-        turn_count: turn_count_for_update(turn_count, running_entry.session_id, update)
+        turn_count: turn_count_for_update(turn_count, running_entry.session_id, update),
+        codex_activity: record_codex_activity(running_entry, update)
       }),
       token_delta
     }
+  end
+
+  # The single `last_codex_message` slot is overwritten by whatever arrived most
+  # recently, which is usually rate-limit or token bookkeeping. The activity log
+  # keeps the substantive events so an operator can see what the agent did.
+  defp record_codex_activity(running_entry, update) do
+    activity = Map.get(running_entry, :codex_activity, [])
+    summarized = summarize_codex_update(update)
+
+    if codex_activity_noise?(summarized) do
+      activity
+    else
+      entry = %{
+        at: update[:timestamp],
+        event: update[:event],
+        message: StatusDashboard.humanize_codex_message(summarized)
+      }
+
+      case activity do
+        [%{message: previous} | _rest] when previous == entry.message -> activity
+        _ -> Enum.take([entry | activity], @codex_activity_limit)
+      end
+    end
+  end
+
+  defp codex_activity_noise?(summarized) do
+    case codex_message_method(summarized) do
+      method when is_binary(method) ->
+        method in @codex_activity_noise_methods or String.ends_with?(method, "Delta") or
+          String.ends_with?(method, "/delta")
+
+      _ ->
+        false
+    end
   end
 
   defp codex_app_server_pid_for_update(_existing, %{codex_app_server_pid: pid})

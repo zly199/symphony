@@ -25,7 +25,7 @@ workspace:
   base_ref: origin/master
 agent:
   max_concurrent_agents: 2
-  max_turns: 60
+  max_turns: 20
 codex:
   command: codex --config shell_environment_policy.inherit=all app-server
   approval_policy: never
@@ -40,13 +40,88 @@ codex:
     networkAccess: true
 ---
 
-You are implementing Backlog ticket `{{ issue.identifier }}` in a dedicated git worktree of the
+You are working Backlog ticket `{{ issue.identifier }}` in a dedicated git worktree of the
 kyuyo-backend repository. The worktree is your working directory; it was created from
 `origin/master` and shares its Git history with `/Users/user/IdeaProjects/kyuyo-backend`.
+
+This ticket runs in two phases separated by a human approval gate. **You are in the
+`{{ phase }}` phase.** Do only that phase's work.
+
+{% if phase == "analysis" %}
+## Analysis phase — no product code
+
+Your single deliverable is the system-analysis document. Writing, editing, or refactoring product
+code in this phase is out of scope, even when the fix looks obvious.
+
+1. Fetch the issue and its comments, read the referenced code, and understand the real cause.
+2. Write the analysis to `ai-workspace/docs/tickets/{{ issue.identifier }}/index.html`, following
+   the repository's fixed 7 sections, and register the link in `ai-workspace/docs/index.html`.
+   These paths live on `master`, so the document lands in the shared knowledge base rather than
+   being scoped to this ticket's code change.
+3. Audit the document with the `system-analysis-review` skill before delivering. A failed audit
+   means rewrite and audit again.
+4. Commit only the analysis document and push the branch. Do not open a merge request yet.
+5. Finish with a short report naming the root cause, the proposed change, and the document path.
+   Then stop. A human reviews the analysis on the Symphony dashboard and either approves it — the
+   implementation phase starts only after that approval — or sends it back with written
+   corrections, which re-runs this phase with those corrections in the prompt.
+
+Do not implement, do not open a merge request, and do not ask to continue. Ending your turn is
+how you hand control back.
+{% else %}
+## Implementation phase — analysis already approved
+
+A human approved the analysis document at
+`ai-workspace/docs/tickets/{{ issue.identifier }}/index.html`. Read it first; it is the agreed
+plan and you implement against it rather than re-deriving an approach.
+
+Update the document only when implementation reveals the plan was wrong, and say so in your
+report when you do.
+{% endif %}
+
+{% if feedback.count > 0 %}
+## Reviewer feedback on the analysis document — highest priority
+
+A human read the analysis document and sent it back for correction. These notes outrank your own
+plan for this run: address every one of them in the document, and do not ask for approval again
+until each is answered.
+
+{% for item in feedback.notes %}- {{ item.note }}
+  _(raised {{ item.requested_at }}{% unless item.delivered %}, not yet seen by any run{% endunless %})_
+{% endfor %}
+Rewrite `ai-workspace/docs/tickets/{{ issue.identifier }}/index.html` to answer them, re-run the
+`system-analysis-review` audit, amend the existing commit, and force-push with
+`--force-with-lease`. In your closing report, state point by point how each note was addressed.
+{% endif %}
 
 {% if attempt %}
 This is continuation attempt {{ attempt }}. Inspect the current workspace and resume completed work.
 Do not restart the task or repeat validation that is still current.
+{% endif %}
+
+{% if resume.started %}
+Workspace state, read by the host from the worktree before this session started. It is ground
+truth; do not spend turns re-deriving it:
+
+- Branch: `{{ resume.branch }}`{% if resume.ticket_branch %} — this ticket's own branch{% endif %}
+- Commits ahead of `{{ resume.base_ref }}`: {{ resume.commits_ahead }}
+{% if resume.head_commit %}- HEAD: `{{ resume.head_commit }}` {{ resume.head_subject }}
+{% endif %}- Uncommitted files: {{ resume.dirty_files }}
+{% if resume.remote_branch %}- Pushed to `{{ resume.remote_branch }}`{% if resume.remote_synced %}, identical to HEAD{% else %}, which differs from HEAD; a push is still pending{% endif %}
+{% else %}- Not pushed to `origin` yet
+{% endif %}
+
+**This ticket already has work in progress.** Symphony's backend restarts between sessions, so an
+empty conversation does not mean an empty ticket. Establish what remains before acting:
+
+1. Read the existing diff with `git log --oneline {{ resume.base_ref }}..HEAD` and
+   `git diff {{ resume.base_ref }}...HEAD` instead of re-analyzing the ticket from scratch.
+2. {% if resume.remote_branch %}The branch is pushed, so a merge request very likely exists. Query it with
+   `glab mr list --source-branch "$(git branch --show-current)"` before creating one.{% else %}The branch is not pushed yet, so no merge request exists.{% endif %}
+3. Re-run only the validation invalidated by changes you make in this session.
+4. When the existing commit, push, and merge request already satisfy the ticket and only human
+   review, merge, or release confirmation remain, say so and stop. Report it as an external
+   blocker rather than repeating checks each turn.
 {% endif %}
 
 Issue:
@@ -82,7 +157,8 @@ Operating rules:
    requirements.
 6. Inspect the existing branch, local changes, remote branch, and existing merge request before
    planning. A branch containing `{{ issue.identifier }}` is existing ticket work and must be
-   resumed with its local changes preserved.
+   resumed with its local changes preserved. Never treat an empty conversation as an unstarted
+   ticket; the backend restarts and the workspace outlives the session.
 7. For a new ticket branch, run the repository branch-preparation step immediately after reading
    the issue and before code or documentation analysis. It fetches `origin` and creates the ticket
    branch directly from `origin/master` inside the worktree. It never checks out `master`, so the
@@ -99,12 +175,14 @@ Operating rules:
 13. Do not claim completion while required validation is failing.
 14. Do not change Backlog status, categories, assignee, or comments unless the ticket explicitly
     requests it or the workflow below authorizes it.
-15. Keep exactly one commit on the ticket branch. The first completed change creates it; every
-    later change on the same ticket amends it with `git commit --amend`. Never stack a second
-    commit, and never rewrite commits that already exist on `origin/master`.
-16. A committed and pushed ticket branch must always have an open merge request targeting
-    `master`. Creating that merge request is part of finishing the ticket, not an optional step.
-    Its title is the branch name with the first `/` replaced by an ASCII `:`.
+15. Keep exactly one commit on the ticket branch. The analysis phase creates it holding the
+    analysis document; the implementation phase amends that same commit with `git commit --amend`
+    so code and analysis ship together. Never stack a second commit, and never rewrite commits
+    that already exist on `origin/master`.
+16. A merge request belongs to the implementation phase only. Once code is committed and pushed,
+    the ticket branch must have an open merge request targeting `master`; creating it is part of
+    finishing the ticket, not an optional step. Its title is the branch name with the first `/`
+    replaced by an ASCII `:`. During the analysis phase, push the branch and open nothing.
 
 Execution workflow:
 
@@ -127,7 +205,23 @@ Execution workflow:
 3. Confirm the resulting branch contains `{{ issue.identifier }}` and its HEAD equals
    `origin/master` when the script reports `created:`. Example:
    `feat/KYUYO_NEW-4658-【backend】【Customer環境】給与計算エラー`.
-4. Build a concise implementation and validation plan from the ticket and actual code.
+{% if phase == "analysis" %}
+4. Read the ticket, its comments, the referenced code, and any design material until you can name
+   the concrete cause and the concrete change, both grounded in file paths and identifiers.
+5. Write `ai-workspace/docs/tickets/{{ issue.identifier }}/index.html` with the fixed 7 sections,
+   and register its link in `ai-workspace/docs/index.html`.
+6. Audit the document with the `system-analysis-review` skill. Rewrite and re-audit until it
+   passes; an unaudited document is not deliverable.
+7. Commit the document with a message containing `{{ issue.identifier }}`, then push with
+   `git push -u origin HEAD` (or `git push --force-with-lease origin HEAD` after an amend).
+8. Report the root cause, the proposed change, and the document path, then end your turn. Do not
+   open a merge request and do not start implementation. A human then either approves on the
+   Symphony dashboard, and Symphony re-dispatches this ticket in the implementation phase, or
+   rejects it with corrections, and Symphony re-dispatches this ticket in the analysis phase with
+   those corrections listed above.
+{% else %}
+4. Read `ai-workspace/docs/tickets/{{ issue.identifier }}/index.html`. It is the approved plan;
+   implement against it instead of forming a new approach.
 5. Implement the smallest complete change.
 6. Review the diff for correctness, security, compatibility, and missing tests.
 7. Run the relevant Maven/module tests and any repository-required checks.
@@ -165,6 +259,7 @@ Execution workflow:
 11. Finish with a compact report of changes, commit, merge-request URL, validation, and blockers.
     When work is incomplete, still commit and push what is validated so the merge request reflects
     the current state, and name what is left.
+{% endif %}
 
 Backlog status handling:
 

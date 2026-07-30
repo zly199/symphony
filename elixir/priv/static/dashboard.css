@@ -351,6 +351,186 @@ pre,
   white-space: nowrap;
 }
 
+.activity-trail {
+  display: grid;
+  gap: 0.3rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  min-width: 0;
+}
+
+.activity-trail li {
+  display: grid;
+  gap: 0.1rem;
+  min-width: 0;
+  padding-left: 0.7rem;
+  border-left: 2px solid var(--line);
+}
+
+/* The newest event is what the agent is doing right now; older ones recede. */
+.activity-trail li:first-child {
+  border-left-color: var(--accent, currentColor);
+}
+
+.activity-trail li:not(:first-child) .event-text {
+  font-weight: 400;
+  opacity: 0.72;
+}
+
+.activity-trail .event-meta {
+  font-size: 0.78rem;
+}
+
+/* The approval gate is the one control on this page that changes agent
+   behaviour, so it reads as an action rather than as metadata. */
+.approve-button {
+  appearance: none;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: white;
+  border-radius: 999px;
+  padding: 0.38rem 0.9rem;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.82rem;
+  font-weight: 600;
+  white-space: nowrap;
+  transition:
+    background 140ms ease,
+    border-color 140ms ease;
+}
+
+.approve-button:hover {
+  background: var(--accent-ink);
+  border-color: var(--accent-ink);
+}
+
+.action-stack {
+  display: grid;
+  gap: 0.5rem;
+  justify-items: start;
+  min-width: 15rem;
+}
+
+.revision-form {
+  display: grid;
+  gap: 0.36rem;
+  width: 100%;
+}
+
+.revision-input {
+  width: 100%;
+  border: 1px solid var(--line-strong);
+  border-radius: 0.5rem;
+  background: rgba(255, 255, 255, 0.72);
+  color: var(--ink);
+  padding: 0.42rem 0.55rem;
+  font: inherit;
+  font-size: 0.82rem;
+  line-height: 1.45;
+  resize: vertical;
+}
+
+.revision-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  background: white;
+}
+
+/* Sending an analysis back is a correction, not a failure, so it stays quieter
+   than the approve action while still reading as a button. */
+.revision-button {
+  appearance: none;
+  border: 1px solid var(--line-strong);
+  background: rgba(255, 255, 255, 0.72);
+  color: var(--ink);
+  border-radius: 999px;
+  padding: 0.34rem 0.86rem;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.82rem;
+  font-weight: 600;
+  white-space: nowrap;
+  justify-self: start;
+  box-shadow: none;
+  transition:
+    background 140ms ease,
+    border-color 140ms ease;
+}
+
+.revision-button:hover {
+  transform: none;
+  box-shadow: none;
+  background: white;
+  border-color: var(--muted);
+}
+
+.feedback-history {
+  width: 100%;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.feedback-history summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.feedback-list {
+  display: grid;
+  gap: 0.3rem;
+  margin: 0.4rem 0 0;
+  padding: 0;
+  list-style: none;
+  min-width: 0;
+}
+
+.feedback-list li {
+  display: grid;
+  gap: 0.1rem;
+  min-width: 0;
+  padding-left: 0.7rem;
+  border-left: 2px solid var(--line);
+}
+
+/* Feedback is prose the operator wrote; it is worth reading in full, unlike the
+   single-line event messages elsewhere on the page. */
+.feedback-list .event-text {
+  white-space: normal;
+  overflow: visible;
+}
+
+.feedback-list .event-meta {
+  font-size: 0.78rem;
+}
+
+.doc-link {
+  font-weight: 600;
+  color: var(--accent-ink);
+}
+
+.flash {
+  margin-bottom: 1rem;
+  padding: 0.7rem 1rem;
+  border-radius: 0.6rem;
+  border: 1px solid var(--line);
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+
+.flash-info {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+}
+
+.flash-error {
+  background: #fdecec;
+  border-color: #d94a4a;
+  color: #8c2020;
+}
+
 .state-badge {
   display: inline-flex;
   align-items: center;

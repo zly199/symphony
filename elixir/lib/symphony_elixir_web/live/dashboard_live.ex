@@ -5,7 +5,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   use Phoenix.LiveView, layout: {SymphonyElixirWeb.Layouts, :app}
 
-  alias SymphonyElixirWeb.{Endpoint, ObservabilityPubSub, Presenter}
+  alias SymphonyElixir.Orchestrator
+  alias SymphonyElixirWeb.{AnalysisDocController, Endpoint, ObservabilityPubSub, Presenter}
   @runtime_tick_ms 1_000
 
   @impl true
@@ -35,6 +36,53 @@ defmodule SymphonyElixirWeb.DashboardLive do
      socket
      |> assign(:payload, load_payload())
      |> assign(:now, DateTime.utc_now())}
+  end
+
+  @impl true
+  def handle_event("approve_analysis", %{"issue-id" => issue_id, "identifier" => identifier}, socket) do
+    socket =
+      case Orchestrator.approve_analysis(issue_id, identifier: identifier, approved_by: "dashboard") do
+        {:ok, _record} ->
+          socket
+          |> put_flash(:info, "已批准 #{identifier}，将进入编码阶段。")
+          |> assign(:payload, load_payload())
+
+        {:error, reason} ->
+          put_flash(socket, :error, "批准 #{identifier} 失败：#{inspect(reason)}")
+
+        :unavailable ->
+          put_flash(socket, :error, "编排器未运行，无法批准 #{identifier}。")
+      end
+
+    {:noreply, assign(socket, :now, DateTime.utc_now())}
+  end
+
+  @impl true
+  def handle_event("request_analysis_revision", %{"issue-id" => issue_id, "identifier" => identifier} = params, socket) do
+    note = Map.get(params, "note")
+
+    socket =
+      case Orchestrator.request_analysis_revision(issue_id,
+             note: note,
+             identifier: identifier,
+             requested_by: "dashboard"
+           ) do
+        {:ok, _note} ->
+          socket
+          |> put_flash(:info, "已记录 #{identifier} 的修改意见，系分将带着它重跑。")
+          |> assign(:payload, load_payload())
+
+        {:error, :empty_note} ->
+          put_flash(socket, :error, "请先填写需要修改的内容，再打回 #{identifier}。")
+
+        {:error, reason} ->
+          put_flash(socket, :error, "记录 #{identifier} 的修改意见失败：#{inspect(reason)}")
+
+        :unavailable ->
+          put_flash(socket, :error, "编排器未运行，无法打回 #{identifier}。")
+      end
+
+    {:noreply, assign(socket, :now, DateTime.utc_now())}
   end
 
   @impl true
@@ -218,6 +266,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <td>
                       <div class="issue-stack">
                         <.issue_identifier identifier={entry.issue_identifier} url={entry.issue_url} />
+                        <.analysis_doc_link identifier={entry.issue_identifier} />
                         <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON 详情</a>
                       </div>
                     </td>
@@ -245,18 +294,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     </td>
                     <td class="numeric"><%= format_runtime_and_turns(entry.started_at, entry.turn_count, @now) %></td>
                     <td>
-                      <div class="detail-stack">
-                        <span
-                          class="event-text"
-                          title={entry.last_message || to_string(entry.last_event || "暂无")}
-                        ><%= entry.last_message || to_string(entry.last_event || "暂无") %></span>
-                        <span class="muted event-meta">
-                          <%= entry.last_event || "暂无" %>
-                          <%= if entry.last_event_at do %>
-                            · <span class="mono numeric"><%= entry.last_event_at %></span>
-                          <% end %>
-                        </span>
-                      </div>
+                      <.codex_activity entry={entry} />
                     </td>
                     <td>
                       <div class="token-stack numeric">
@@ -275,7 +313,10 @@ defmodule SymphonyElixirWeb.DashboardLive do
           <div class="section-header">
             <div>
               <h2 class="section-title">已阻塞的会话</h2>
-              <p class="section-copy">Codex 请求操作人员输入或批准后暂停的问题。</p>
+              <p class="section-copy">
+                等待人工处理的问题：系分已产出待批准、Codex 请求输入，或连续多轮无进展。
+                系分文档可以直接批准，也可以写下修改意见打回；意见会随下一轮系分交给 Codex。
+              </p>
             </div>
           </div>
 
@@ -283,7 +324,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
             <p class="empty-state">当前没有已阻塞的会话。</p>
           <% else %>
             <div class="table-wrap">
-              <table class="data-table" style="min-width: 760px;">
+              <table class="data-table" style="min-width: 1040px;">
                 <thead>
                   <tr>
                     <th>问题</th>
@@ -291,7 +332,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <th>会话</th>
                     <th>阻塞时间</th>
                     <th>最近更新</th>
-                    <th>错误</th>
+                    <th>原因</th>
+                    <th>操作</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -299,6 +341,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <td>
                       <div class="issue-stack">
                         <.issue_identifier identifier={entry.issue_identifier} url={entry.issue_url} />
+                        <.analysis_doc_link identifier={entry.issue_identifier} />
                         <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON 详情</a>
                       </div>
                     </td>
@@ -324,20 +367,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     </td>
                     <td class="mono"><%= entry.blocked_at || "暂无" %></td>
                     <td>
-                      <div class="detail-stack">
-                        <span
-                          class="event-text"
-                          title={entry.last_message || to_string(entry.last_event || "暂无")}
-                        ><%= entry.last_message || to_string(entry.last_event || "暂无") %></span>
-                        <span class="muted event-meta">
-                          <%= entry.last_event || "暂无" %>
-                          <%= if entry.last_event_at do %>
-                            · <span class="mono numeric"><%= entry.last_event_at %></span>
-                          <% end %>
-                        </span>
-                      </div>
+                      <.codex_activity entry={entry} />
                     </td>
                     <td><%= entry.error || "暂无" %></td>
+                    <td>
+                      <.analysis_gate_actions entry={entry} />
+                    </td>
                   </tr>
                 </tbody>
               </table>
@@ -418,6 +453,113 @@ defmodule SymphonyElixirWeb.DashboardLive do
     <% else %>
       <span class="issue-id"><%= @identifier %></span>
     <% end %>
+    """
+  end
+
+  attr(:identifier, :string, required: true)
+
+  # The analysis document lives inside the ticket's worktree, so it is invisible
+  # from the operator's own checkout until the branch merges. This link opens it
+  # in place.
+  defp analysis_doc_link(assigns) do
+    assigns = assign(assigns, :exists, AnalysisDocController.doc_exists?(assigns.identifier))
+
+    ~H"""
+    <%= if @exists do %>
+      <a
+        class="issue-link doc-link"
+        href={AnalysisDocController.doc_path(@identifier)}
+        target="_blank"
+        rel="noopener noreferrer"
+      >系分文档 ↗</a>
+    <% end %>
+    """
+  end
+
+  attr(:entry, :map, required: true)
+
+  # A gated analysis needs both answers, not just "approve": rejecting it without
+  # saying what is wrong would send the same document back for another pass. The
+  # note travels into the next run's prompt, so this form is the operator's way of
+  # talking to the agent.
+  defp analysis_gate_actions(assigns) do
+    assigns =
+      assigns
+      |> assign(:gated, assigns.entry.block_reason in [:awaiting_analysis_approval, :analysis_incomplete])
+      |> assign(:approvable, assigns.entry.block_reason == :awaiting_analysis_approval)
+      |> assign(:feedback, Map.get(assigns.entry, :analysis_feedback, []))
+
+    ~H"""
+    <%= if @gated do %>
+      <div class="action-stack">
+        <%= if @approvable do %>
+          <button
+            type="button"
+            class="approve-button"
+            phx-click="approve_analysis"
+            phx-value-issue-id={@entry.issue_id}
+            phx-value-identifier={@entry.issue_identifier}
+            data-confirm={"批准 #{@entry.issue_identifier} 进入编码阶段？"}
+          >
+            批准继续
+          </button>
+        <% end %>
+
+        <form class="revision-form" phx-submit="request_analysis_revision">
+          <input type="hidden" name="issue-id" value={@entry.issue_id} />
+          <input type="hidden" name="identifier" value={@entry.issue_identifier} />
+          <textarea
+            class="revision-input"
+            name="note"
+            rows="3"
+            required
+            placeholder="写下系分文档需要修正的地方，将随下一轮系分交给 Codex"
+          ></textarea>
+          <button type="submit" class="revision-button">打回修改</button>
+        </form>
+
+        <%= if @feedback != [] do %>
+          <details class="feedback-history">
+            <summary>已提交意见 <%= length(@feedback) %> 条</summary>
+            <ol class="feedback-list">
+              <li :for={note <- @feedback}>
+                <span class="event-text"><%= note.note %></span>
+                <span class="muted event-meta mono numeric">
+                  <%= note.requested_at %> · <%= if note.delivered, do: "已交给系分", else: "待下一轮系分" %>
+                </span>
+              </li>
+            </ol>
+          </details>
+        <% end %>
+      </div>
+    <% else %>
+      <span class="muted">无需操作</span>
+    <% end %>
+    """
+  end
+
+  attr(:entry, :map, required: true)
+
+  # The last raw event is almost always rate-limit or token bookkeeping, so the
+  # trail of substantive events is what tells an operator what the agent did.
+  defp codex_activity(assigns) do
+    assigns = assign(assigns, :events, Enum.take(Map.get(assigns.entry, :recent_events, []), 6))
+
+    ~H"""
+    <div class="detail-stack">
+      <%= if @events == [] do %>
+        <span class="event-text muted">暂无动态</span>
+      <% else %>
+        <ol class="activity-trail">
+          <li :for={event <- @events}>
+            <span class="event-text" title={event.message || to_string(event.event || "")}><%= event.message || to_string(event.event || "暂无") %></span>
+            <%= if event.at do %>
+              <span class="muted event-meta mono numeric"><%= event.at %></span>
+            <% end %>
+          </li>
+        </ol>
+      <% end %>
+    </div>
     """
   end
 

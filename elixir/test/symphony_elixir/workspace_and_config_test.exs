@@ -4,6 +4,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.Config.Schema.{Codex, StringOrMap}
   alias SymphonyElixir.Linear.Client
+  alias SymphonyElixir.{PromptBuilder, ResumeState}
+  alias SymphonyElixir.Tracker.Issue
 
   test "workspace bootstrap can be implemented in after_create hook" do
     test_root =
@@ -1962,5 +1964,146 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  describe "resume state" do
+    test "reports an untouched workspace as unstarted" do
+      with_resume_repo(fn repo ->
+        assert %{available: true, started: false, commits_ahead: 0, ticket_branch: false} =
+                 ResumeState.inspect_workspace(repo, %Issue{identifier: "MT-900"})
+      end)
+    end
+
+    test "reports the ticket branch, commit, and pending push" do
+      with_resume_repo(fn repo ->
+        git!(repo, ["checkout", "-b", "fix/MT-900-null-check"])
+        File.write!(Path.join(repo, "fix.txt"), "fix\n")
+        git!(repo, ["add", "fix.txt"])
+        git!(repo, ["commit", "-m", "fix: MT-900 guard null"])
+
+        state = ResumeState.inspect_workspace(repo, %Issue{identifier: "MT-900"})
+
+        assert state.started
+        assert state.ticket_branch
+        assert state.branch == "fix/MT-900-null-check"
+        assert state.commits_ahead == 1
+        assert state.head_subject == "fix: MT-900 guard null"
+        assert state.dirty_files == 0
+        assert state.remote_branch == nil
+        refute state.remote_synced
+      end)
+    end
+
+    test "reports a pushed branch as synced with its remote" do
+      with_resume_repo(fn repo ->
+        git!(repo, ["checkout", "-b", "fix/MT-900-null-check"])
+        File.write!(Path.join(repo, "fix.txt"), "fix\n")
+        git!(repo, ["add", "fix.txt"])
+        git!(repo, ["commit", "-m", "fix: MT-900 guard null"])
+        git!(repo, ["push", "origin", "HEAD"])
+        File.write!(Path.join(repo, "scratch.txt"), "wip\n")
+
+        state = ResumeState.inspect_workspace(repo, %Issue{identifier: "MT-900"})
+
+        assert state.remote_branch == "origin/fix/MT-900-null-check"
+        assert state.remote_synced
+        assert state.dirty_files == 1
+      end)
+    end
+
+    test "treats a missing or non-git workspace as unavailable" do
+      assert %{available: false, started: false} =
+               ResumeState.inspect_workspace(System.tmp_dir!(), %Issue{identifier: "MT-900"})
+
+      assert %{available: false} = ResumeState.inspect_workspace(nil, %Issue{identifier: "MT-900"})
+    end
+
+    test "prompt builder renders resume facts only for started work" do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        prompt: """
+        Ticket {{ issue.identifier }}.
+        {% if resume.started %}RESUME branch={{ resume.branch }} ahead={{ resume.commits_ahead }}{% endif %}
+        """
+      )
+
+      issue = %Issue{identifier: "MT-901", title: "Resume", state: "In Progress"}
+
+      assert PromptBuilder.build_prompt(issue, []) =~ "Ticket MT-901."
+      refute PromptBuilder.build_prompt(issue, []) =~ "RESUME"
+
+      resume = %{ResumeState.empty() | started: true, branch: "fix/MT-901-x", commits_ahead: 2}
+
+      assert PromptBuilder.build_prompt(issue, resume: resume) =~
+               "RESUME branch=fix/MT-901-x ahead=2"
+    end
+
+    test "prompt builder renders reviewer feedback with its delivery state" do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        prompt: """
+        Ticket {{ issue.identifier }}.
+        {% if feedback.count > 0 %}FEEDBACK pending={{ feedback.pending_count }}
+        {% for item in feedback.notes %}- {{ item.note }}{% unless item.delivered %} (new){% endunless %}
+        {% endfor %}{% endif %}
+        """
+      )
+
+      issue = %Issue{identifier: "MT-902", title: "Feedback", state: "In Progress"}
+
+      refute PromptBuilder.build_prompt(issue, []) =~ "FEEDBACK"
+
+      feedback = [
+        %{note: "第 3 节缺少数据流", requested_at: "2026-07-30T01:00:00Z", requested_by: "dashboard", delivered_at: "2026-07-30T01:05:00Z"},
+        %{note: "回归用例不足", requested_at: "2026-07-30T02:00:00Z", requested_by: "dashboard", delivered_at: nil}
+      ]
+
+      prompt = PromptBuilder.build_prompt(issue, feedback: feedback)
+
+      assert prompt =~ "FEEDBACK pending=1"
+      assert prompt =~ "- 第 3 节缺少数据流\n"
+      assert prompt =~ "- 回归用例不足 (new)"
+    end
+  end
+
+  defp with_resume_repo(fun) do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-resume-#{System.unique_integer([:positive])}"
+      )
+
+    repo = Path.join(test_root, "worktree")
+    remote = Path.join(test_root, "remote.git")
+
+    try do
+      File.mkdir_p!(repo)
+      git!(remote, ["init", "--bare", "-b", "master"], init: true)
+
+      git!(repo, ["init", "-b", "master"])
+      git!(repo, ["config", "user.name", "Test User"])
+      git!(repo, ["config", "user.email", "test@example.com"])
+      git!(repo, ["remote", "add", "origin", remote])
+      File.write!(Path.join(repo, "README.md"), "base\n")
+      git!(repo, ["add", "README.md"])
+      git!(repo, ["commit", "-m", "initial"])
+      git!(repo, ["push", "origin", "master"])
+
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_base_ref: "origin/master")
+
+      fun.(repo)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  defp git!(directory, args, opts \\ []) do
+    if Keyword.get(opts, :init, false) do
+      File.mkdir_p!(directory)
+    end
+
+    {output, status} = System.cmd("git", ["-C", directory | args], stderr_to_stdout: true)
+
+    assert status == 0, "git #{Enum.join(args, " ")} failed: #{output}"
+
+    String.trim(output)
   end
 end
