@@ -1,6 +1,6 @@
 defmodule SymphonyElixir.AnalysisDoc do
   @moduledoc """
-  Locates the analysis document a work item produces in its workspace.
+  Locates the shared analysis document a work item produces.
 
   The approval gate and the dashboard both need to know whether the deliverable
   actually exists, so the location rule lives here rather than in either caller.
@@ -11,10 +11,11 @@ defmodule SymphonyElixir.AnalysisDoc do
   @docs_subpath "ai-workspace/docs"
 
   @doc """
-  Returns the `ai-workspace/docs` root inside `identifier`'s workspace.
+  Returns the legacy `ai-workspace/docs` root inside `identifier`'s workspace.
 
   The path is canonicalized and re-checked against the configured workspace
-  root, so a crafted identifier cannot point outside it.
+  root, so a crafted identifier cannot point outside it. This remains available
+  as a fallback for workflows that do not configure a source repository.
   """
   @spec docs_root(String.t() | nil) :: {:ok, Path.t()} | {:error, term()}
   def docs_root(workspace_key) when is_binary(workspace_key) do
@@ -34,11 +35,10 @@ defmodule SymphonyElixir.AnalysisDoc do
   def docs_root(_workspace_key), do: {:error, :missing_workspace_key}
 
   @doc """
-  Returns the source repository's docs root, used as a read-only fallback.
+  Returns the source repository's shared docs root.
 
-  A ticket worktree only carries the docs files present at its checked-out
-  commit, so shared assets like the stylesheet often live solely in the source
-  repository. Serving them from there keeps the document rendering correctly.
+  Repository-backed worktree workflows keep `ai-workspace` outside Git so every
+  ticket reads and updates the same knowledge base.
   """
   @spec repository_docs_root() :: {:ok, Path.t()} | {:error, term()}
   def repository_docs_root do
@@ -62,8 +62,14 @@ defmodule SymphonyElixir.AnalysisDoc do
   @doc "Returns the analysis document path for `identifier`, if resolvable."
   @spec doc_file(String.t() | nil) :: {:ok, Path.t()} | {:error, term()}
   def doc_file(identifier) when is_binary(identifier) do
-    with {:ok, docs_root} <- identifier |> Workspace.workspace_key() |> docs_root() do
-      {:ok, Path.join([docs_root, "tickets", identifier, "index.html"])}
+    case repository_docs_root() do
+      {:ok, docs_root} ->
+        {:ok, Path.join([docs_root, "tickets", identifier, "index.html"])}
+
+      {:error, _repository_reason} ->
+        with {:ok, docs_root} <- identifier |> Workspace.workspace_key() |> docs_root() do
+          {:ok, Path.join([docs_root, "tickets", identifier, "index.html"])}
+        end
     end
   end
 

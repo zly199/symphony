@@ -22,9 +22,9 @@ defmodule SymphonyElixir.DispatchGate do
 
   @file_name "dispatch_gate.json"
 
-  @statuses ["started", "paused"]
+  @statuses ["started", "paused", "review"]
 
-  @type status :: :waiting | :started | :paused
+  @type status :: :waiting | :started | :paused | :review
 
   @type record :: %{
           issue_id: String.t(),
@@ -53,6 +53,10 @@ defmodule SymphonyElixir.DispatchGate do
   @spec paused?(String.t() | nil) :: boolean()
   def paused?(issue_id), do: status(issue_id) == :paused
 
+  @doc "Returns true when `issue_id` is waiting for operator review."
+  @spec review?(String.t() | nil) :: boolean()
+  def review?(issue_id), do: status(issue_id) == :review
+
   @doc "Returns the gate record for `issue_id`, or nil when it is untouched."
   @spec fetch(String.t() | nil) :: record() | nil
   def fetch(issue_id) when is_binary(issue_id), do: Map.get(load(), issue_id)
@@ -77,8 +81,13 @@ defmodule SymphonyElixir.DispatchGate do
   @spec pause(String.t(), keyword()) :: {:ok, record()} | {:error, term()}
   def pause(issue_id, opts \\ []) when is_binary(issue_id), do: put(issue_id, :paused, opts)
 
+  @doc "Hands completed work to the operator and prevents further agent dispatch."
+  @spec handoff_for_review(String.t(), keyword()) :: {:ok, record()} | {:error, term()}
+  def handoff_for_review(issue_id, opts \\ []) when is_binary(issue_id),
+    do: put(issue_id, :review, opts)
+
   @doc """
-  Returns a paused `issue_id` to `:started`.
+  Returns a held `issue_id` to `:started`.
 
   Resuming is not the same as starting over: the item was already authorized, so
   it goes back to running rather than back to the queue for another decision.

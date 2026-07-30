@@ -4,7 +4,7 @@ defmodule SymphonyElixir.ExtensionsTest do
   import Phoenix.ConnTest
   import Phoenix.LiveViewTest
 
-  alias SymphonyElixir.AnalysisFeedback
+  alias SymphonyElixir.OperatorFeedback
   alias SymphonyElixir.DispatchGate
   alias SymphonyElixir.Linear.Adapter
   alias SymphonyElixir.Tracker.Memory
@@ -683,10 +683,10 @@ defmodule SymphonyElixir.ExtensionsTest do
     html = submit_revision(view, "第 3 节缺少数据流")
 
     assert html =~ "已记录 MT-BLOCKED 的修改意见"
-    assert [%{note: "第 3 节缺少数据流", identifier: "MT-BLOCKED"}] = AnalysisFeedback.notes("issue-blocked")
+    assert [%{note: "第 3 节缺少数据流", identifier: "MT-BLOCKED"}] = OperatorFeedback.notes("issue-blocked")
 
     assert submit_revision(view, "   ") =~ "请先填写需要修改的内容"
-    assert length(AnalysisFeedback.notes("issue-blocked")) == 1
+    assert length(OperatorFeedback.notes("issue-blocked")) == 1
   end
 
   test "dashboard liveview walks a ticket from waiting through started and paused" do
@@ -964,21 +964,25 @@ defmodule SymphonyElixir.ExtensionsTest do
     setup do
       identifier = "MT-DOC"
       workspace = Path.join(Config.local_workspace_root(), Workspace.workspace_key(identifier))
-      docs_root = Path.join(workspace, "ai-workspace/docs")
 
-      # Assets live only in the source repository, mirroring a real worktree
-      # whose checked-out commit predates them.
+      # Analysis documents and assets share the source repository's ai-workspace.
       repository = Path.join(System.tmp_dir!(), "symphony-elixir-doc-repo-#{System.unique_integer([:positive])}")
       repository_docs = Path.join(repository, "ai-workspace/docs")
 
       File.mkdir_p!(Path.join(repository_docs, "assets"))
       File.write!(Path.join(repository_docs, "assets/docs.css"), ".diagram-caption { color: red; }")
+      File.mkdir_p!(Path.join(repository_docs, "tickets/#{identifier}"))
+
+      File.write!(
+        Path.join(repository_docs, "tickets/#{identifier}/index.html"),
+        "<h1>系分 MT-DOC</h1>"
+      )
+
       File.write!(Path.join(repository, "repo-secret.txt"), "must not be served")
 
       write_workflow_file!(Workflow.workflow_file_path(), workspace_repository: repository)
 
-      File.mkdir_p!(Path.join(docs_root, "tickets/#{identifier}"))
-      File.write!(Path.join(docs_root, "tickets/#{identifier}/index.html"), "<h1>系分 MT-DOC</h1>")
+      File.mkdir_p!(workspace)
       File.write!(Path.join(workspace, "secret.txt"), "must not be served")
 
       start_test_endpoint([])
@@ -998,7 +1002,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       assert response_content_type(conn, :html) =~ "text/html"
 
       # The document links its stylesheet as ../../assets/docs.css, which
-      # resolves under the same prefix and falls back to the source repository.
+      # resolves under the same shared-docs prefix.
       css_conn = get(build_conn(), "/analysis/#{identifier}/assets/docs.css")
 
       assert response(css_conn, 200) =~ "diagram-caption"

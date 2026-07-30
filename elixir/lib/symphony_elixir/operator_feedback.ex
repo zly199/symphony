@@ -1,20 +1,27 @@
-defmodule SymphonyElixir.AnalysisFeedback do
+defmodule SymphonyElixir.OperatorFeedback do
   @moduledoc """
-  Records the operator's written corrections to a work item's analysis document.
+  Records the operator's written corrections to a work item, at whichever gate it
+  is parked.
 
-  Approval is only half of the gate. An analysis that is wrong needs a way back
-  into the flow, and the correction has to reach the next Codex run instead of
-  staying in the operator's head, so notes are persisted beside the approvals and
-  rendered into the next analysis prompt. Each note keeps the run that consumed
-  it visible through `delivered_at`, which is what lets the dashboard distinguish
-  feedback still waiting for a run from feedback an agent has already seen.
+  Approval is only half of a gate. Work that is wrong needs a way back into the
+  flow, and the correction has to reach the next Codex run instead of staying in
+  the operator's head, so notes are persisted beside the approvals and rendered
+  into the next prompt. Every gate uses this one channel — a rejected analysis, a
+  review that found a problem in the merge request, a summary that needs
+  rewriting — which is why a note carries the `phase` it was written against: the
+  prompt renders "fix the document" and "fix the implementation" differently, and
+  only the phase tells them apart.
+
+  Each note keeps the run that consumed it visible through `delivered_at`, which
+  is what lets the dashboard distinguish feedback still waiting for a run from
+  feedback an agent has already seen.
   """
 
   require Logger
 
   alias SymphonyElixir.StateFile
 
-  @file_name "analysis_feedback.json"
+  @file_name "operator_feedback.json"
 
   # A note is operator prose, not a document: enough room to describe what is
   # wrong, bounded so a paste accident cannot crowd out the prompt itself.
@@ -24,8 +31,11 @@ defmodule SymphonyElixir.AnalysisFeedback do
   # replaying to the agent every run.
   @max_notes 20
 
+  @phases ["analysis", "implementation", "summary"]
+
   @type note :: %{
           note: String.t(),
+          phase: String.t(),
           identifier: String.t() | nil,
           requested_at: String.t(),
           requested_by: String.t() | nil,
@@ -49,10 +59,11 @@ defmodule SymphonyElixir.AnalysisFeedback do
   def pending?(issue_id), do: pending(issue_id) != []
 
   @doc """
-  Appends `text` as feedback on `issue_id`'s analysis.
+  Appends `text` as feedback on `issue_id`.
 
-  Blank text is rejected rather than stored: an empty note would send the ticket
-  back for another analysis pass without telling the agent what to change.
+  `:phase` names the work the note is about, so the next prompt can say what to
+  rewrite. Blank text is rejected rather than stored: an empty note would send the
+  ticket back for another pass without telling the agent what to change.
   """
   @spec add(String.t(), String.t() | nil, keyword()) :: {:ok, note()} | {:error, term()}
   def add(issue_id, text, opts \\ []) when is_binary(issue_id) do
@@ -60,6 +71,7 @@ defmodule SymphonyElixir.AnalysisFeedback do
       {:ok, text} ->
         note = %{
           "note" => text,
+          "phase" => normalize_phase(Keyword.get(opts, :phase)),
           "identifier" => Keyword.get(opts, :identifier),
           "requested_at" => DateTime.utc_now() |> DateTime.to_iso8601(),
           "requested_by" => Keyword.get(opts, :requested_by, "dashboard"),
@@ -70,7 +82,7 @@ defmodule SymphonyElixir.AnalysisFeedback do
 
         case put(issue_id, stored) do
           :ok ->
-            Logger.info("Recorded analysis feedback issue_id=#{issue_id} identifier=#{inspect(note["identifier"])} notes=#{length(stored)}")
+            Logger.info("Recorded operator feedback issue_id=#{issue_id} identifier=#{inspect(note["identifier"])} phase=#{note["phase"]} notes=#{length(stored)}")
 
             {:ok, decode_note(note)}
 
@@ -107,7 +119,7 @@ defmodule SymphonyElixir.AnalysisFeedback do
         if count == 0 do
           :ok
         else
-          Logger.info("Marked analysis feedback as delivered issue_id=#{issue_id} notes=#{count}")
+          Logger.info("Marked operator feedback as delivered issue_id=#{issue_id} notes=#{count}")
 
           put(issue_id, marked)
         end
@@ -135,6 +147,14 @@ defmodule SymphonyElixir.AnalysisFeedback do
 
   defp normalize_note(_text), do: {:error, :empty_note}
 
+  # Analysis is the phase every ticket passes through, so it is what an
+  # unlabelled note — including one written by an older Symphony — belongs to.
+  defp normalize_phase(phase) when is_atom(phase) and not is_nil(phase),
+    do: normalize_phase(Atom.to_string(phase))
+
+  defp normalize_phase(phase) when phase in @phases, do: phase
+  defp normalize_phase(_phase), do: "analysis"
+
   defp put(issue_id, notes) do
     StateFile.write_map(@file_name, Map.put(load_raw(), issue_id, notes))
   end
@@ -152,6 +172,7 @@ defmodule SymphonyElixir.AnalysisFeedback do
   defp decode_note(note) when is_map(note) do
     %{
       note: note["note"] || note[:note],
+      phase: normalize_phase(note["phase"] || note[:phase]),
       identifier: note["identifier"] || note[:identifier],
       requested_at: note["requested_at"] || note[:requested_at],
       requested_by: note["requested_by"] || note[:requested_by],

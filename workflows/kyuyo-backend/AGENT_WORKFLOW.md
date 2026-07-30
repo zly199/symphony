@@ -9,8 +9,13 @@
 
 - `/Users/user/symphony/WORKFLOW.backlog.md`：Backlog 调度配置与无人值守入口提示。
 - `/Users/user/symphony/workflows/kyuyo-backend/AGENT_WORKFLOW.md`：流程、工作法、交付、验证纪律。
-- `ai-workspace/governance/KYUYO_DOMAIN.md`：业务与系统知识，覆盖模块、代码位置、版本语义、履历化、Cosmos、系统架构、迁移、业务陷阱。
-- `ai-workspace/governance/CODING_RULES.md`：代码相关规则，覆盖实现原则、命名、错误码、注释、日志、测试编写、编译、执行、验证、Review、代码风格。
+- `/Users/user/IdeaProjects/kyuyo-backend/ai-workspace/governance/KYUYO_DOMAIN.md`：业务与系统知识，覆盖模块、代码位置、版本语义、履历化、Cosmos、系统架构、迁移、业务陷阱。
+- `/Users/user/IdeaProjects/kyuyo-backend/ai-workspace/governance/CODING_RULES.md`：代码相关规则，覆盖实现原则、命名、错误码、注释、日志、测试编写、编译、执行、验证、Review、代码风格。
+
+`ai-workspace` 是主仓库检出目录中的共享工作区，未纳入 Git。本文出现的所有
+`ai-workspace/...` 路径都解析为
+`/Users/user/IdeaProjects/kyuyo-backend/ai-workspace/...`，允许票代理直接读写。该目录的
+任何文件都禁止执行 `git add`、提交或推送。
 
 ### Update Targets
 
@@ -45,13 +50,13 @@ Avoid:
 
 ### Before Business Or System Judgement
 
-- 先读 `ai-workspace/governance/KYUYO_DOMAIN.md`。
+- 先读 `/Users/user/IdeaProjects/kyuyo-backend/ai-workspace/governance/KYUYO_DOMAIN.md`。
 - 再读具体 Backlog、评论、设计资料和代码。
 - 涉及模块定位、版本语义、履历化、Cosmos 持久化规则时必须执行本步骤。
 
 ### Before Code Work Or Review
 
-- 先读 `ai-workspace/governance/CODING_RULES.md`。
+- 先读 `/Users/user/IdeaProjects/kyuyo-backend/ai-workspace/governance/CODING_RULES.md`。
 - 写代码、改代码、写测试、跑测试、做 code review 都适用。
 - 涉及跨模块、跨版本、common/app 聚合边界时，先确认模块职责、调用方向、既有扩展点与作废条件。
 
@@ -80,7 +85,8 @@ Avoid:
 
 - Symphony 无人值守跑票时，工作目录是该票专属的 git worktree（`/Users/user/IdeaProjects/kyuyo-worktrees/<票号>`），与用户自己使用的
   `/Users/user/IdeaProjects/kyuyo-backend` 共享同一份 Git 历史但互不干扰。
-- 只在自己的 worktree 内改文件、切分支、跑构建。禁止在 `/Users/user/IdeaProjects/kyuyo-backend` 内切分支、改文件、reset、stash 或删除；该目录只允许读取。
+- 产品代码修改、分支切换和构建只在自己的 worktree 内进行。`/Users/user/IdeaProjects/kyuyo-backend` 的产品代码与 Git 状态只允许读取，禁止在该目录切分支、修改产品代码、reset、stash 或删除。
+- `/Users/user/IdeaProjects/kyuyo-backend/ai-workspace` 是共享可写例外。治理文件、系分文档、设计书转换产物和文档索引都直接在这里读写，不在票 worktree 中查找或创建 `ai-workspace`。
 - worktree 内不得 checkout `master`：`master` 由用户的检出占用，切换会直接失败。基线一律用 `origin/master`。
 - 票结束（Backlog 转入终态）后 Symphony 才回收 worktree；worktree 内还有未提交内容时保留不删。
 - 可能同时有多票各自在自己的 worktree 里并行推进。只操作自己这一票的 worktree 和分支，不读改其他票的 worktree，不共用临时文件路径。
@@ -120,6 +126,24 @@ Avoid:
 - 禁止自动合并 MR。
 - `glab` 未认证或建 MR 失败时，把具体失败原因作为阻断项报告，不得默默结束票。
 - 工作未做完也要把已验证的部分提交并推送，让 MR 反映当前状态，同时说明剩余项。
+
+### CI And Human Review Gate
+
+- 推送 MR 后使用 `glab ci status --live` 等待当前分支最新 HEAD 的 pipeline 到达终态。CI
+  通常运行 20–30 分钟，pending/running 属于正常等待。保持同一个命令和当前 Codex turn，
+  禁止使用固定少量轮询、两分钟等待窗口或在 CI 运行中结束 turn。
+- 工具返回可继续读取的运行句柄时，持续读取该句柄，直到 CI 成功、失败、取消或确认外部阻断。
+  每次等待最多 60 秒，整段 CI 等待保留至少 40 分钟。
+- CI 失败或取消时，读取失败 job 与日志，定位具体原因，完成修复、本地验证、diff review、
+  单 commit amend 与 `--force-with-lease` 推送，再等待新 HEAD 对应的新 pipeline。持续执行该闭环，
+  直到最新 pipeline 成功。
+- CI 成功后执行最终交付门禁：核对本地 HEAD、远端分支与 MR HEAD 一致；票内测试要求、仓库
+  必要检查与相关静态检查全部通过；完整 diff 完成正确性、安全性、兼容性、复杂度、测试覆盖
+  review；MR 无待处理的有效反馈。发现问题后修复并重新走推送与 CI。
+- `memory_checkpoint` 记录 CI 等待状态，记录动作不会结束当前 turn。
+- 所有门禁完成后调用 `symphony_handoff_for_review`，summary 写明 CI 与 review 证据。调用成功后
+  工单进入待人工 Review 门禁，Symphony 停止 continuation turn。该工具只允许在最新 CI 成功后调用。
+- 人工 Review 后需要返工时，在 dashboard 点击“Review 后继续推进”。MR 禁止自动合并。
 
 ### Backlog Reading
 
@@ -317,8 +341,8 @@ Avoid:
 - 明确根因与有效对策后，抽象成可复用防再犯规则。
 - 流程或工作法问题写入
   `/Users/user/symphony/workflows/kyuyo-backend/AGENT_WORKFLOW.md`。
-- 业务或系统知识写入 `ai-workspace/governance/KYUYO_DOMAIN.md`。
-- 代码或测试规则写入 `ai-workspace/governance/CODING_RULES.md`。
+- 业务或系统知识写入 `/Users/user/IdeaProjects/kyuyo-backend/ai-workspace/governance/KYUYO_DOMAIN.md`。
+- 代码或测试规则写入 `/Users/user/IdeaProjects/kyuyo-backend/ai-workspace/governance/CODING_RULES.md`。
 - 倾向性、尚不足以成文的经验用 `memory_lesson_save` 落 agentmemory，由 weekly-retro 复核后升格为硬规则或淘汰。
 
 ### Preferred

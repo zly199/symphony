@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.CoreTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.{AnalysisFeedback, ApprovalStore, DispatchGate}
+  alias SymphonyElixir.{ApprovalStore, DispatchGate, OperatorFeedback}
 
   test "config defaults and validation checks" do
     write_workflow_file!(Workflow.workflow_file_path(),
@@ -1025,6 +1025,25 @@ defmodule SymphonyElixir.CoreTest do
              AgentRunner.continue_with_issue_for_test(issue, fetcher)
   end
 
+  test "agent runner stops after handing completed work to operator review" do
+    issue = %Issue{
+      id: "issue-review-complete",
+      identifier: "MT-REVIEW-COMPLETE",
+      title: "Wait for review",
+      state: "In Progress"
+    }
+
+    {:ok, _record} =
+      DispatchGate.handoff_for_review(issue.id,
+        identifier: issue.identifier,
+        updated_by: "agent-review-handoff"
+      )
+
+    fetcher = fn _issue_ids -> flunk("review handoff must stop before another tracker refresh") end
+
+    assert {:done, ^issue} = AgentRunner.continue_with_issue_for_test(issue, fetcher)
+  end
+
   test "normal worker exit schedules active-state continuation retry" do
     issue_id = "issue-resume"
     ref = make_ref()
@@ -1065,6 +1084,60 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
     assert_due_in_range(due_at_ms, 500, 1_100)
+  end
+
+  test "normal worker exit after review handoff parks without a continuation retry" do
+    issue_id = "issue-review-park"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :ReviewHandoffOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-REVIEW-PARK",
+      state: "In Progress"
+    }
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: issue.identifier,
+      issue: issue,
+      started_at: DateTime.utc_now()
+    }
+
+    {:ok, _record} = ApprovalStore.approve(issue_id)
+
+    {:ok, _record} =
+      DispatchGate.handoff_for_review(issue_id,
+        identifier: issue.identifier,
+        updated_by: "agent-review-handoff"
+      )
+
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.running, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+
+    assert %{block_reason: :awaiting_human_review, error: error} = state.blocked[issue_id]
+    assert error =~ "waiting for operator review"
   end
 
   test "repeated continuations without tracker progress back off" do
@@ -1263,7 +1336,7 @@ defmodule SymphonyElixir.CoreTest do
     refute MapSet.member?(state.claimed, issue_id)
     refute ApprovalStore.approved?(issue_id)
     assert AgentRunner.phase_for(issue) == :analysis
-    assert AnalysisFeedback.pending?(issue_id)
+    assert OperatorFeedback.pending?(issue_id)
   end
 
   test "feedback on an approved issue returns it to the analysis phase" do
@@ -1307,29 +1380,29 @@ defmodule SymphonyElixir.CoreTest do
     assert {:error, :empty_note} =
              Orchestrator.request_analysis_revision(pid, issue_id, identifier: "MT-986")
 
-    assert AnalysisFeedback.notes(issue_id) == []
+    assert OperatorFeedback.notes(issue_id) == []
     assert %{block_reason: :awaiting_analysis_approval} = :sys.get_state(pid).blocked[issue_id]
   end
 
   test "delivered feedback stays as history while new feedback reads as pending" do
     issue_id = "issue-analysis-feedback-delivery"
 
-    {:ok, _note} = AnalysisFeedback.add(issue_id, "补充异常分支", identifier: "MT-987")
-    assert AnalysisFeedback.pending?(issue_id)
+    {:ok, _note} = OperatorFeedback.add(issue_id, "补充异常分支", identifier: "MT-987")
+    assert OperatorFeedback.pending?(issue_id)
 
-    :ok = AnalysisFeedback.mark_delivered(issue_id)
+    :ok = OperatorFeedback.mark_delivered(issue_id)
 
-    assert [%{note: "补充异常分支", delivered_at: delivered_at}] = AnalysisFeedback.notes(issue_id)
+    assert [%{note: "补充异常分支", delivered_at: delivered_at}] = OperatorFeedback.notes(issue_id)
     assert is_binary(delivered_at)
-    refute AnalysisFeedback.pending?(issue_id)
+    refute OperatorFeedback.pending?(issue_id)
 
-    {:ok, _note} = AnalysisFeedback.add(issue_id, "回归用例不足", identifier: "MT-987")
+    {:ok, _note} = OperatorFeedback.add(issue_id, "回归用例不足", identifier: "MT-987")
 
-    assert [%{note: "补充异常分支"}, %{note: "回归用例不足"}] = AnalysisFeedback.notes(issue_id)
-    assert [%{note: "回归用例不足"}] = AnalysisFeedback.pending(issue_id)
+    assert [%{note: "补充异常分支"}, %{note: "回归用例不足"}] = OperatorFeedback.notes(issue_id)
+    assert [%{note: "回归用例不足"}] = OperatorFeedback.pending(issue_id)
 
-    :ok = AnalysisFeedback.clear(issue_id)
-    assert AnalysisFeedback.notes(issue_id) == []
+    :ok = OperatorFeedback.clear(issue_id)
+    assert OperatorFeedback.notes(issue_id) == []
   end
 
   test "starting an issue releases dispatch and moves the tracker item into progress" do
@@ -1631,6 +1704,7 @@ defmodule SymphonyElixir.CoreTest do
     assert DispatchGate.status(nil) == :waiting
     refute DispatchGate.started?(issue_id)
     refute DispatchGate.paused?(issue_id)
+    refute DispatchGate.review?(issue_id)
     assert DispatchGate.fetch(issue_id) == nil
     assert DispatchGate.fetch(nil) == nil
     assert DispatchGate.statuses() == %{}
@@ -1651,6 +1725,16 @@ defmodule SymphonyElixir.CoreTest do
     assert paused.updated_by == "tester"
     assert DispatchGate.statuses() == %{issue_id => :paused}
     refute DispatchGate.started?(issue_id)
+
+    assert {:ok, review} =
+             DispatchGate.handoff_for_review(issue_id,
+               identifier: "MT-993",
+               updated_by: "agent-review-handoff"
+             )
+
+    assert review.status == :review
+    assert DispatchGate.review?(issue_id)
+    assert DispatchGate.statuses() == %{issue_id => :review}
 
     assert {:ok, resumed} = DispatchGate.resume(issue_id)
     assert resumed.status == :started

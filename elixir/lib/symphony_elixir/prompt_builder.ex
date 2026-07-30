@@ -59,6 +59,9 @@ defmodule SymphonyElixir.PromptBuilder do
   defp feedback_note(note) when is_map(note) do
     %{
       "note" => Map.get(note, :note),
+      # The phase says which artifact the note is about, which is what lets one
+      # template render "rewrite the document" and "fix the code" from one list.
+      "phase" => Map.get(note, :phase) || "analysis",
       "requested_at" => Map.get(note, :requested_at),
       "requested_by" => Map.get(note, :requested_by),
       "delivered" => not is_nil(Map.get(note, :delivered_at))

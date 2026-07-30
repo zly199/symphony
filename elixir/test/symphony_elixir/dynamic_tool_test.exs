@@ -51,9 +51,13 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     )
 
     binding = BoundDynamicTool.bind()
+    assert Enum.any?(binding.tool_specs, &(&1["name"] == "symphony_handoff_for_review"))
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
-    assert BoundDynamicTool.bind().tool_specs == []
+
+    assert Enum.map(BoundDynamicTool.bind().tool_specs, & &1["name"]) == [
+             "symphony_handoff_for_review"
+           ]
 
     test_pid = self()
 
@@ -73,6 +77,31 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert tracker_settings.api_key == "session-token"
     assert tracker_settings.project_slug == "session-project"
     assert response["success"] == true
+  end
+
+  test "review handoff tool parks the issue and records gate evidence" do
+    binding = BoundDynamicTool.bind()
+
+    issue = %Issue{
+      id: "issue-review-handoff",
+      identifier: "MT-REVIEW",
+      title: "Ready for review",
+      state: "In Progress"
+    }
+
+    response =
+      BoundDynamicTool.execute(
+        "symphony_handoff_for_review",
+        %{"summary" => "pipeline 123 succeeded; final diff review passed"},
+        binding,
+        issue: issue
+      )
+
+    assert response["success"] == true
+    assert SymphonyElixir.DispatchGate.review?(issue.id)
+
+    assert %{status: :review, identifier: "MT-REVIEW", updated_by: "agent-review-handoff"} =
+             SymphonyElixir.DispatchGate.fetch(issue.id)
   end
 
   test "linear_graphql returns successful GraphQL responses as tool text" do

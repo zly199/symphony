@@ -38,38 +38,47 @@ defmodule SymphonyElixirWeb.DashboardLive do
      |> assign(:now, DateTime.utc_now())}
   end
 
+  # One control, whatever the gate. The orchestrator decides what "keep going"
+  # means for this item's state, and says so in the reply, which is what the
+  # flash reports back.
   @impl true
-  def handle_event("approve_analysis", %{"issue-id" => issue_id, "identifier" => identifier}, socket) do
+  def handle_event("advance_issue", %{"issue-id" => issue_id, "identifier" => identifier}, socket) do
     socket =
-      case Orchestrator.approve_analysis(issue_id, identifier: identifier, approved_by: "dashboard") do
-        {:ok, _record} ->
+      case Orchestrator.advance_issue(issue_id,
+             identifier: identifier,
+             approved_by: "dashboard",
+             updated_by: "dashboard"
+           ) do
+        {:ok, record} ->
           socket
-          |> put_flash(:info, "已批准 #{identifier}，将进入编码阶段。")
+          |> put_flash(:info, advance_flash(identifier, record))
           |> assign(:payload, load_payload())
 
         {:error, reason} ->
-          put_flash(socket, :error, "批准 #{identifier} 失败：#{inspect(reason)}")
+          put_flash(socket, :error, "推进 #{identifier} 失败：#{inspect(reason)}")
 
         :unavailable ->
-          put_flash(socket, :error, "编排器未运行，无法批准 #{identifier}。")
+          put_flash(socket, :error, "编排器未运行，无法推进 #{identifier}。")
       end
 
     {:noreply, assign(socket, :now, DateTime.utc_now())}
   end
 
+  # The counterpart control: every gate that can be approved can also be answered
+  # with what is wrong, so no state leaves the operator with only one move.
   @impl true
-  def handle_event("request_analysis_revision", %{"issue-id" => issue_id, "identifier" => identifier} = params, socket) do
+  def handle_event("submit_feedback", %{"issue-id" => issue_id, "identifier" => identifier} = params, socket) do
     note = Map.get(params, "note")
 
     socket =
-      case Orchestrator.request_analysis_revision(issue_id,
+      case Orchestrator.submit_feedback(issue_id,
              note: note,
              identifier: identifier,
              requested_by: "dashboard"
            ) do
-        {:ok, _note} ->
+        {:ok, note} ->
           socket
-          |> put_flash(:info, "已记录 #{identifier} 的修改意见，系分将带着它重跑。")
+          |> put_flash(:info, feedback_flash(identifier, note))
           |> assign(:payload, load_payload())
 
         {:error, :empty_note} ->
@@ -80,25 +89,6 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
         :unavailable ->
           put_flash(socket, :error, "编排器未运行，无法打回 #{identifier}。")
-      end
-
-    {:noreply, assign(socket, :now, DateTime.utc_now())}
-  end
-
-  @impl true
-  def handle_event("start_issue", %{"issue-id" => issue_id, "identifier" => identifier}, socket) do
-    socket =
-      case Orchestrator.start_issue(issue_id, identifier: identifier, updated_by: "dashboard") do
-        {:ok, record} ->
-          socket
-          |> put_flash(:info, start_flash(identifier, record))
-          |> assign(:payload, load_payload())
-
-        {:error, reason} ->
-          put_flash(socket, :error, "开始调度 #{identifier} 失败：#{inspect(reason)}")
-
-        :unavailable ->
-          put_flash(socket, :error, "编排器未运行，无法调度 #{identifier}。")
       end
 
     {:noreply, assign(socket, :now, DateTime.utc_now())}
@@ -118,25 +108,6 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
         :unavailable ->
           put_flash(socket, :error, "编排器未运行，无法暂停 #{identifier}。")
-      end
-
-    {:noreply, assign(socket, :now, DateTime.utc_now())}
-  end
-
-  @impl true
-  def handle_event("resume_issue", %{"issue-id" => issue_id, "identifier" => identifier}, socket) do
-    socket =
-      case Orchestrator.resume_issue(issue_id, identifier: identifier) do
-        {:ok, _record} ->
-          socket
-          |> put_flash(:info, "已恢复 #{identifier}，下一轮轮询会重新派发。")
-          |> assign(:payload, load_payload())
-
-        {:error, reason} ->
-          put_flash(socket, :error, "恢复 #{identifier} 失败：#{inspect(reason)}")
-
-        :unavailable ->
-          put_flash(socket, :error, "编排器未运行，无法恢复 #{identifier}。")
       end
 
     {:noreply, assign(socket, :now, DateTime.utc_now())}
@@ -242,6 +213,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
               <p class="section-copy">
                 票源里所有未关闭的票都会进来，默认停在「等待调度」，不跑、不花 token。
                 点「开始调度」才会真正派发，同时把票源状态改成 <%= start_state_label(@payload.tracker.active_states) %>。
+                之后每个停下来的关口都是同一对操作：左边的按钮向前推进（批准系分 → 编码 → CI 通过后 Review → 生成 MR 总结 → 确认完成），
+                下面的输入框写意见打回，Codex 会带着意见重跑对应阶段。
                 推进不下去的票可以「暂停推进」：会停掉正在跑的会话，并一直停在已阻塞区，直到手动「恢复推进」。
                 <%= if @payload.tracker.synced_at do %>
                   最近同步：<span class="mono numeric"><%= @payload.tracker.synced_at %></span>
@@ -285,11 +258,19 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <td><%= format_labels(entry.labels) %></td>
                     <td class="mono numeric"><%= entry.updated_at || "暂无" %></td>
                     <td>
-                      <.gate_actions
-                        issue_id={entry.issue_id}
-                        identifier={entry.issue_identifier}
-                        run_status={entry.run_status}
-                      />
+                      <div class="action-stack">
+                        <.advance_action
+                          issue_id={entry.issue_id}
+                          identifier={entry.issue_identifier}
+                          run_status={entry.run_status}
+                          review_approved={entry.review_approved}
+                        />
+                        <.pause_action
+                          issue_id={entry.issue_id}
+                          identifier={entry.issue_identifier}
+                          run_status={entry.run_status}
+                        />
+                      </div>
                     </td>
                   </tr>
                 </tbody>
@@ -393,8 +374,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
             <div>
               <h2 class="section-title">已阻塞的会话</h2>
               <p class="section-copy">
-                等待人工处理的问题：系分已产出待批准、Codex 请求输入、连续多轮无进展，或被手动暂停。
-                系分文档可以直接批准，也可以写下修改意见打回；意见会随下一轮系分交给 Codex。
+                等待人工处理的问题：系分已产出待批准、CI 通过待 Review、MR 总结已出待合并、Codex 请求输入、
+                连续多轮无进展，或被手动暂停。每一行都给两个出口——按钮向前推进，输入框写意见打回，
+                意见会随下一轮运行交给 Codex，重跑的是这一关对应的阶段（系分 / 编码 / MR 总结）。
                 已暂停的票会一直停在这里，只有点「恢复推进」才会重新排期。
               </p>
             </div>
@@ -451,16 +433,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     </td>
                     <td><%= entry.error || "暂无" %></td>
                     <td>
-                      <div class="action-stack">
-                        <.gate_actions
-                          issue_id={entry.issue_id}
-                          identifier={entry.issue_identifier}
-                          run_status={entry.run_status}
-                        />
-                        <%= if entry.run_status != :paused do %>
-                          <.analysis_gate_actions entry={entry} />
-                        <% end %>
-                      </div>
+                      <.gate_decision entry={entry} />
                     </td>
                   </tr>
                 </tbody>
@@ -547,9 +520,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   attr(:identifier, :string, required: true)
 
-  # The analysis document lives inside the ticket's worktree, so it is invisible
-  # from the operator's own checkout until the branch merges. This link opens it
-  # in place.
+  # Analysis documents live in the source repository's shared ai-workspace.
   defp analysis_doc_link(assigns) do
     assigns = assign(assigns, :exists, AnalysisDocController.doc_exists?(assigns.identifier))
 
@@ -568,38 +539,41 @@ defmodule SymphonyElixirWeb.DashboardLive do
   attr(:issue_id, :string, required: true)
   attr(:identifier, :string, required: true)
   attr(:run_status, :atom, default: :waiting)
+  attr(:review_approved, :boolean, default: false)
+  attr(:block_reason, :atom, default: nil)
 
-  # One control per row, showing the only move that makes sense for where the item
-  # is: start it, pause it, or pick it back up. Every row carries it, because a
-  # ticket stops being worth pushing at any point in its run — including after a
-  # restart, which is why a paused row still offers the way back out.
-  defp gate_actions(assigns) do
+  # The one control that pushes an item forward, wherever it stopped. The label
+  # changes because the decision does — start, approve, review, finish — but the
+  # operator presses the same button, and the orchestrator works out which
+  # decision this state needs.
+  defp advance_action(assigns) do
+    assigns =
+      assigns
+      |> assign(:label, advance_label(assigns.run_status, assigns.block_reason, assigns.review_approved))
+      |> assign(:class, advance_class(assigns.run_status, assigns.block_reason))
+
     ~H"""
-    <%= if @run_status == :waiting do %>
-      <button
-        type="button"
-        class="start-button"
-        phx-click="start_issue"
-        phx-value-issue-id={@issue_id}
-        phx-value-identifier={@identifier}
-        data-confirm={"开始调度 #{@identifier}？Codex 会开始跑并消耗 token。"}
-      >
-        开始调度
-      </button>
-    <% end %>
+    <button
+      type="button"
+      class={@class}
+      phx-click="advance_issue"
+      phx-value-issue-id={@issue_id}
+      phx-value-identifier={@identifier}
+      data-confirm={advance_confirm(@identifier, @run_status, @block_reason, @review_approved)}
+    >
+      <%= @label %>
+    </button>
+    """
+  end
 
-    <%= if @run_status == :paused do %>
-      <button
-        type="button"
-        class="resume-button"
-        phx-click="resume_issue"
-        phx-value-issue-id={@issue_id}
-        phx-value-identifier={@identifier}
-      >
-        恢复推进
-      </button>
-    <% end %>
+  attr(:issue_id, :string, required: true)
+  attr(:identifier, :string, required: true)
+  attr(:run_status, :atom, default: :waiting)
 
+  # Pausing stays its own control: it is the one move that is not "forward", and
+  # a ticket stops being worth pushing at any point in its run.
+  defp pause_action(assigns) do
+    ~H"""
     <%= if @run_status == :started do %>
       <button
         type="button"
@@ -617,61 +591,59 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   attr(:entry, :map, required: true)
 
-  # A gated analysis needs both answers, not just "approve": rejecting it without
-  # saying what is wrong would send the same document back for another pass. The
-  # note travels into the next run's prompt, so this form is the operator's way of
-  # talking to the agent.
-  defp analysis_gate_actions(assigns) do
+  # Every gate needs both answers, not just "approve": sending work back without
+  # saying what is wrong would produce the same output again, and a gate that only
+  # offers approval leaves an operator who disagrees with nowhere to go. The note
+  # travels into the next run's prompt, so this form is how they talk to the agent.
+  defp gate_decision(assigns) do
     assigns =
       assigns
-      |> assign(:gated, assigns.entry.block_reason in [:awaiting_analysis_approval, :analysis_incomplete])
-      |> assign(:approvable, assigns.entry.block_reason == :awaiting_analysis_approval)
-      |> assign(:feedback, Map.get(assigns.entry, :analysis_feedback, []))
+      |> assign(:feedback, Map.get(assigns.entry, :feedback, []))
+      |> assign(:review_approved, Map.get(assigns.entry, :review_approved, false))
 
     ~H"""
-    <%= if @gated do %>
-      <div class="action-stack">
-        <%= if @approvable do %>
-          <button
-            type="button"
-            class="approve-button"
-            phx-click="approve_analysis"
-            phx-value-issue-id={@entry.issue_id}
-            phx-value-identifier={@entry.issue_identifier}
-            data-confirm={"批准 #{@entry.issue_identifier} 进入编码阶段？"}
-          >
-            批准继续
-          </button>
-        <% end %>
+    <div class="action-stack">
+      <.advance_action
+        issue_id={@entry.issue_id}
+        identifier={@entry.issue_identifier}
+        run_status={@entry.run_status}
+        review_approved={@review_approved}
+        block_reason={@entry.block_reason}
+      />
 
-        <form class="revision-form" phx-submit="request_analysis_revision">
-          <input type="hidden" name="issue-id" value={@entry.issue_id} />
-          <input type="hidden" name="identifier" value={@entry.issue_identifier} />
-          <textarea
-            class="revision-input"
-            name="note"
-            rows="3"
-            required
-            placeholder="写下系分文档需要修正的地方，将随下一轮系分交给 Codex"
-          ></textarea>
-          <button type="submit" class="revision-button">打回修改</button>
-        </form>
+      <.pause_action
+        issue_id={@entry.issue_id}
+        identifier={@entry.issue_identifier}
+        run_status={@entry.run_status}
+      />
 
-        <%= if @feedback != [] do %>
-          <details class="feedback-history">
-            <summary>已提交意见 <%= length(@feedback) %> 条</summary>
-            <ol class="feedback-list">
-              <li :for={note <- @feedback}>
-                <span class="event-text"><%= note.note %></span>
-                <span class="muted event-meta mono numeric">
-                  <%= note.requested_at %> · <%= if note.delivered, do: "已交给系分", else: "待下一轮系分" %>
-                </span>
-              </li>
-            </ol>
-          </details>
-        <% end %>
-      </div>
-    <% end %>
+      <form class="revision-form" phx-submit="submit_feedback">
+        <input type="hidden" name="issue-id" value={@entry.issue_id} />
+        <input type="hidden" name="identifier" value={@entry.issue_identifier} />
+        <textarea
+          class="revision-input"
+          name="note"
+          rows="3"
+          required
+          placeholder={feedback_placeholder(@entry.block_reason, @review_approved)}
+        ></textarea>
+        <button type="submit" class="revision-button">提交意见并重跑</button>
+      </form>
+
+      <%= if @feedback != [] do %>
+        <details class="feedback-history">
+          <summary>已提交意见 <%= length(@feedback) %> 条</summary>
+          <ol class="feedback-list">
+            <li :for={note <- @feedback}>
+              <span class="event-text"><%= note.note %></span>
+              <span class="muted event-meta mono numeric">
+                <%= note.requested_at %> · <%= feedback_phase_label(note.phase) %> · <%= if note.delivered, do: "已交给 Codex", else: "待下一轮" %>
+              </span>
+            </li>
+          </ol>
+        </details>
+      <% end %>
+    </div>
     """
   end
 
@@ -793,18 +765,99 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp runtime_status_label("retrying"), do: "重试中"
   defp runtime_status_label("blocked"), do: "已阻塞"
   defp runtime_status_label("paused"), do: "已暂停"
+  defp runtime_status_label("review"), do: "待人工 Review"
+  defp runtime_status_label("merge_pending"), do: "总结已出，待合并"
   defp runtime_status_label("queued"), do: "排队中"
   defp runtime_status_label(_status), do: "等待调度"
 
+  # The label has to name the decision, not the mechanism: an operator pressing
+  # this needs to know whether they are spending tokens, approving a plan, or
+  # ending the ticket.
+  defp advance_label(:waiting, _block_reason, _review_approved), do: "开始调度"
+  defp advance_label(:paused, _block_reason, _review_approved), do: "恢复推进"
+  defp advance_label(:review, _block_reason, true), do: "确认完成"
+  defp advance_label(:review, _block_reason, _review_approved), do: "Review 通过，生成 MR 总结"
+  defp advance_label(:started, :awaiting_analysis_approval, _review_approved), do: "批准继续"
+  defp advance_label(:started, :analysis_incomplete, _review_approved), do: "重跑系分"
+  defp advance_label(_run_status, _block_reason, _review_approved), do: "继续推进"
+
+  defp advance_class(:waiting, _block_reason), do: "start-button"
+  defp advance_class(:paused, _block_reason), do: "resume-button"
+  defp advance_class(_run_status, _block_reason), do: "approve-button"
+
+  # Only the moves that spend tokens or end the ticket are worth a confirmation.
+  defp advance_confirm(identifier, :waiting, _block_reason, _review_approved),
+    do: "开始调度 #{identifier}？Codex 会开始跑并消耗 token。"
+
+  defp advance_confirm(identifier, :review, _block_reason, true),
+    do: "确认 #{identifier} 已完成？Symphony 不再推进，合并 MR 与关票由你手动完成。"
+
+  defp advance_confirm(identifier, :review, _block_reason, _review_approved),
+    do: "确认 #{identifier} 的实现与 CI 没问题？Codex 会用 git-mr-summary 生成 MR 总结。"
+
+  defp advance_confirm(identifier, :started, :awaiting_analysis_approval, _review_approved),
+    do: "批准 #{identifier} 进入编码阶段？"
+
+  defp advance_confirm(_identifier, _run_status, _block_reason, _review_approved), do: nil
+
+  # The placeholder is the only thing telling the operator which artifact this box
+  # sends back, and each gate sends back a different one.
+  defp feedback_placeholder(:awaiting_analysis_approval, _review_approved),
+    do: "写下系分文档需要修正的地方，将随下一轮系分交给 Codex"
+
+  defp feedback_placeholder(:analysis_incomplete, _review_approved),
+    do: "写下系分文档需要补齐的地方，将随下一轮系分交给 Codex"
+
+  defp feedback_placeholder(:awaiting_merge, _review_approved),
+    do: "写下 MR 总结需要改写的地方，Codex 会重新生成总结"
+
+  defp feedback_placeholder(_block_reason, true),
+    do: "写下 MR 总结需要改写的地方，Codex 会重新生成总结"
+
+  defp feedback_placeholder(:awaiting_human_review, _review_approved),
+    do: "写下 review 发现的问题，Codex 会回到编码阶段修改并重跑 CI"
+
+  defp feedback_placeholder(_block_reason, _review_approved),
+    do: "写下需要 Codex 处理的内容，将随下一轮运行交给它"
+
+  defp feedback_phase_label("analysis"), do: "系分"
+  defp feedback_phase_label("implementation"), do: "编码"
+  defp feedback_phase_label("summary"), do: "MR 总结"
+  defp feedback_phase_label(_phase), do: "系分"
+
   # The tracker write can fail while the start itself holds, so the flash says which
   # of the two happened instead of a flat "done".
-  defp start_flash(identifier, %{tracker_state: {:ok, state_name}}) do
+  defp advance_flash(identifier, %{tracker_state: {:ok, state_name}}) do
     "已开始调度 #{identifier}，票源状态已改为 #{state_name}。"
   end
 
-  defp start_flash(identifier, %{tracker_state: {:error, reason}}) do
+  defp advance_flash(identifier, %{tracker_state: {:error, reason}}) do
     "已开始调度 #{identifier}，但票源状态未能更新（#{inspect(reason)}），请手动确认。"
   end
+
+  defp advance_flash(identifier, %{decision: :approve_analysis}),
+    do: "已批准 #{identifier}，将进入编码阶段。"
+
+  defp advance_flash(identifier, %{decision: :approve_review}),
+    do: "已确认 #{identifier} 的 review，下一轮运行会调用 git-mr-summary 生成 MR 总结。"
+
+  defp advance_flash(identifier, %{decision: :finish}),
+    do: "已把 #{identifier} 标记为完成，Symphony 不再推进；合并 MR 与关票请手动完成。"
+
+  defp advance_flash(identifier, %{decision: :resume}),
+    do: "已恢复 #{identifier}，下一轮轮询会重新派发。"
+
+  defp advance_flash(identifier, _record),
+    do: "已推进 #{identifier}，下一轮轮询会重新派发。"
+
+  defp feedback_flash(identifier, %{phase: "summary"}),
+    do: "已记录 #{identifier} 的意见，Codex 会重新生成 MR 总结。"
+
+  defp feedback_flash(identifier, %{phase: "implementation"}),
+    do: "已记录 #{identifier} 的 review 意见，Codex 会回到编码阶段修改并重跑 CI。"
+
+  defp feedback_flash(identifier, _note),
+    do: "已记录 #{identifier} 的修改意见，系分将带着它重跑。"
 
   defp start_state_label(active_states) when is_list(active_states) do
     Enum.find(active_states, "进行中", &(is_binary(&1) and String.trim(&1) != ""))

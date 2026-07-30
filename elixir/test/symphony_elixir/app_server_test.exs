@@ -670,12 +670,18 @@ defmodule SymphonyElixir.AppServerTest do
                    case get_in(payload, ["params", "dynamicTools"]) do
                      [
                        %{
-                         "description" => description,
+                         "description" => tracker_description,
                          "inputSchema" => %{"required" => ["query"]},
                          "name" => "linear_graphql"
+                       },
+                       %{
+                         "description" => handoff_description,
+                         "inputSchema" => %{"required" => ["summary"]},
+                         "name" => "symphony_handoff_for_review"
                        }
                      ] ->
-                       description =~ "Linear"
+                       tracker_description =~ "Linear" and
+                         handoff_description =~ "operator for review"
 
                      _ ->
                        false

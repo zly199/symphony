@@ -10,10 +10,10 @@ defmodule SymphonyElixir.Orchestrator do
   alias SymphonyElixir.{
     AgentRunner,
     AnalysisDoc,
-    AnalysisFeedback,
     ApprovalStore,
     Config,
     DispatchGate,
+    OperatorFeedback,
     StatusDashboard,
     Tracker,
     Workspace
@@ -40,6 +40,8 @@ defmodule SymphonyElixir.Orchestrator do
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @paused_error "paused by the operator; no further runs until it is resumed"
+  @review_error "implementation gates passed; waiting for operator review"
+  @summary_error "merge-request summary written; waiting for the operator to finish the ticket"
   @empty_codex_totals %{
     input_tokens: 0,
     output_tokens: 0,
@@ -236,6 +238,9 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp handle_agent_down(:normal, state, issue_id, running_entry, session_id) do
     cond do
+      DispatchGate.review?(issue_id) ->
+        block_review_handoff_agent_down(state, issue_id, running_entry, session_id)
+
       DispatchGate.paused?(issue_id) ->
         block_paused_agent_down(state, issue_id, running_entry, session_id)
 
@@ -252,6 +257,9 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp handle_agent_down(reason, state, issue_id, running_entry, session_id) do
     cond do
+      DispatchGate.review?(issue_id) ->
+        block_review_handoff_agent_down(state, issue_id, running_entry, session_id)
+
       # A pause outranks the retry ladder: an exit that would normally be retried
       # is the operator's cue that this item is going nowhere.
       DispatchGate.paused?(issue_id) ->
@@ -263,6 +271,23 @@ defmodule SymphonyElixir.Orchestrator do
       true ->
         retry_agent_down(state, issue_id, running_entry, session_id, reason)
     end
+  end
+
+  # The same handoff tool ends both the implementation run and the summary run, so
+  # what the operator is being asked for is read from the review approval rather
+  # than from the call: before it, "does this change look right"; after it, "the
+  # description is written, the merge is yours".
+  defp block_review_handoff_agent_down(state, issue_id, running_entry, session_id) do
+    {error, reason} =
+      if ApprovalStore.review_approved?(issue_id) do
+        {@summary_error, :awaiting_merge}
+      else
+        {@review_error, :awaiting_human_review}
+      end
+
+    Logger.info("Agent task handed off for review: issue_id=#{issue_id} issue_identifier=#{Map.get(running_entry, :identifier)} session_id=#{session_id} reason=#{reason}")
+
+    block_issue_from_entry(state, issue_id, running_entry, error, reason)
   end
 
   defp block_paused_agent_down(state, issue_id, running_entry, session_id) do
@@ -621,7 +646,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       # Nothing but an explicit resume clears a pause, so the checks below that
       # release a block on their own do not get a say here.
-      DispatchGate.paused?(issue.id) ->
+      DispatchGate.paused?(issue.id) or DispatchGate.review?(issue.id) ->
         refresh_blocked_issue_state(state, issue)
 
       !issue_routable?(issue) ->
@@ -1781,6 +1806,53 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc """
+  Moves `issue_id` past whichever gate it is currently parked at.
+
+  Every gate needs one control that means "this is fine, keep going", and which
+  decision that is depends only on where the item stopped: start it, approve the
+  analysis, approve the post-CI review so the summary phase runs, resume a pause,
+  or simply re-dispatch a run that stopped for input. Giving each of those its own
+  dashboard button made the operator work out the state machine; this works it out
+  for them.
+  """
+  @spec advance_issue(String.t(), keyword()) :: {:ok, map()} | {:error, term()} | :unavailable
+  def advance_issue(issue_id, opts \\ []), do: advance_issue(__MODULE__, issue_id, opts)
+
+  @spec advance_issue(GenServer.server(), String.t(), keyword()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def advance_issue(server, issue_id, opts) when is_binary(issue_id) do
+    if is_pid(server) or Process.whereis(server) do
+      GenServer.call(server, {:advance_issue, issue_id, opts})
+    else
+      :unavailable
+    end
+  end
+
+  @doc """
+  Records operator feedback on `issue_id` at whichever gate it is parked at, and
+  sends it back for another pass of the phase that feedback belongs to.
+
+  This is the counterpart to `advance_issue/3`, and the reason no gate is a
+  dead end: an operator who disagrees with what the agent produced can always say
+  why instead of only being able to approve it. A rejected analysis re-runs
+  analysis; a review that found a problem in the merge request re-runs
+  implementation without losing the analysis approval; a summary that reads badly
+  re-runs the summary.
+  """
+  @spec submit_feedback(String.t(), keyword()) :: {:ok, map()} | {:error, term()} | :unavailable
+  def submit_feedback(issue_id, opts \\ []), do: submit_feedback(__MODULE__, issue_id, opts)
+
+  @spec submit_feedback(GenServer.server(), String.t(), keyword()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def submit_feedback(server, issue_id, opts) when is_binary(issue_id) do
+    if is_pid(server) or Process.whereis(server) do
+      GenServer.call(server, {:submit_feedback, issue_id, opts})
+    else
+      :unavailable
+    end
+  end
+
+  @doc """
   Records operator feedback on `issue_id`'s analysis and sends it back for
   another analysis pass.
 
@@ -1989,13 +2061,29 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_call({:approve_analysis, issue_id, opts}, _from, state) do
-    case ApprovalStore.approve(issue_id, opts) do
-      {:ok, record} ->
-        Logger.info("Releasing approval block issue_id=#{issue_id}; next dispatch runs in implementation phase")
+    apply_advance(state, issue_id, opts, :approve_analysis)
+  end
 
-        # Dropping the claim lets the next poll pick the item up again, this
-        # time with the approval on record.
-        state = release_issue_claim(state, issue_id)
+  def handle_call({:request_analysis_revision, issue_id, opts}, _from, state) do
+    record_feedback(state, issue_id, opts, :analysis)
+  end
+
+  def handle_call({:submit_feedback, issue_id, opts}, _from, state) do
+    record_feedback(state, issue_id, opts, feedback_phase(state, issue_id))
+  end
+
+  def handle_call({:advance_issue, issue_id, opts}, _from, state) do
+    advance_from_gate(state, issue_id, opts, advance_decision(state, issue_id))
+  end
+
+  def handle_call({:start_issue, issue_id, opts}, _from, state) do
+    apply_advance(state, issue_id, opts, :start)
+  end
+
+  def handle_call({:pause_issue, issue_id, opts}, _from, state) do
+    case DispatchGate.pause(issue_id, opts) do
+      {:ok, record} ->
+        state = park_paused_issue(state, issue_id)
         notify_dashboard()
 
         {:reply, {:ok, record}, state}
@@ -2005,23 +2093,57 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  def handle_call({:request_analysis_revision, issue_id, opts}, _from, state) do
-    case AnalysisFeedback.add(issue_id, Keyword.get(opts, :note), opts) do
-      {:ok, note} ->
-        # Feedback rejects the current analysis, so an approval recorded earlier no
-        # longer holds; the item owes another analysis pass before implementation.
-        _ = ApprovalStore.revoke(issue_id)
+  def handle_call({:resume_issue, issue_id, opts}, _from, state) do
+    apply_advance(state, issue_id, opts, :resume)
+  end
 
-        Logger.info("Recorded analysis revision request issue_id=#{issue_id} identifier=#{inspect(note.identifier)}; next dispatch re-runs analysis")
+  def handle_call(:request_refresh, _from, state) do
+    coalesced = poll_now_coalesced?(state)
+    state = request_poll_now(state)
 
-        {:reply, {:ok, note}, release_for_revision(state, issue_id)}
+    {:reply,
+     %{
+       queued: true,
+       coalesced: coalesced,
+       requested_at: DateTime.utc_now(),
+       operations: ["poll", "reconcile"]
+     }, state}
+  end
 
-      {:error, reason} ->
-        {:reply, {:error, reason}, state}
+  # What "keep going" means at each gate. The item's own state answers it, so the
+  # dashboard can offer one button everywhere instead of asking the operator to
+  # work out which of five decisions this particular stop needs.
+  defp advance_decision(%State{} = state, issue_id) do
+    case DispatchGate.status(issue_id) do
+      :waiting ->
+        :start
+
+      :paused ->
+        :resume
+
+      :review ->
+        # The review gate is used twice: once for the implementation, once for the
+        # summary written after it. The review approval says which one this is.
+        if ApprovalStore.review_approved?(issue_id), do: :finish, else: :approve_review
+
+      :started ->
+        if blocked_reason(state, issue_id) == :awaiting_analysis_approval,
+          do: :approve_analysis,
+          else: :redispatch
     end
   end
 
-  def handle_call({:start_issue, issue_id, opts}, _from, state) do
+  defp advance_from_gate(%State{} = state, issue_id, opts, decision) do
+    {:reply, reply, state} = apply_advance(state, issue_id, opts, decision)
+    {:reply, tag_decision(reply, decision), state}
+  end
+
+  defp tag_decision({:ok, record}, decision) when is_map(record),
+    do: {:ok, Map.put(record, :decision, decision)}
+
+  defp tag_decision(reply, _decision), do: reply
+
+  defp apply_advance(%State{} = state, issue_id, opts, :start) do
     case DispatchGate.start(issue_id, opts) do
       {:ok, record} ->
         {state, tracker_state} = move_started_issue_to_start_state(state, issue_id)
@@ -2040,20 +2162,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  def handle_call({:pause_issue, issue_id, opts}, _from, state) do
-    case DispatchGate.pause(issue_id, opts) do
-      {:ok, record} ->
-        state = park_paused_issue(state, issue_id)
-        notify_dashboard()
-
-        {:reply, {:ok, record}, state}
-
-      {:error, reason} ->
-        {:reply, {:error, reason}, state}
-    end
-  end
-
-  def handle_call({:resume_issue, issue_id, opts}, _from, state) do
+  defp apply_advance(%State{} = state, issue_id, opts, :resume) do
     case DispatchGate.resume(issue_id, opts) do
       {:ok, record} ->
         Logger.info("Released operator pause issue_id=#{issue_id}; the next poll dispatches it again")
@@ -2070,18 +2179,127 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  def handle_call(:request_refresh, _from, state) do
-    coalesced = poll_now_coalesced?(state)
-    state = request_poll_now(state)
+  defp apply_advance(%State{} = state, issue_id, opts, :approve_analysis) do
+    case ApprovalStore.approve(issue_id, opts) do
+      {:ok, record} ->
+        Logger.info("Releasing approval block issue_id=#{issue_id}; next dispatch runs in implementation phase")
 
-    {:reply,
-     %{
-       queued: true,
-       coalesced: coalesced,
-       requested_at: DateTime.utc_now(),
-       operations: ["poll", "reconcile"]
-     }, state}
+        # Dropping the claim lets the next poll pick the item up again, this
+        # time with the approval on record.
+        state = release_issue_claim(state, issue_id)
+        notify_dashboard()
+
+        {:reply, {:ok, record}, state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
   end
+
+  defp apply_advance(%State{} = state, issue_id, opts, :approve_review) do
+    case ApprovalStore.approve_review(issue_id, opts) do
+      {:ok, record} ->
+        # The handoff left the item at the review gate, which blocks dispatch;
+        # returning it to `:started` is what lets the summary run happen.
+        _ = DispatchGate.resume(issue_id, opts)
+
+        Logger.info("Review approved by operator issue_id=#{issue_id}; next dispatch writes the merge-request summary")
+
+        state = state |> release_issue_claim(issue_id) |> request_poll_now()
+        notify_dashboard()
+
+        {:reply, {:ok, record}, state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  # Nothing is left for Symphony once the summary exists: merging and closing the
+  # ticket are the operator's, so finishing parks the item exactly as a pause
+  # does, and the same resume brings it back if they change their mind.
+  defp apply_advance(%State{} = state, issue_id, opts, :finish) do
+    case DispatchGate.pause(issue_id, opts) do
+      {:ok, record} ->
+        Logger.info("Ticket finished by operator issue_id=#{issue_id}; no further dispatch until it is resumed")
+
+        state = park_paused_issue(state, issue_id)
+        notify_dashboard()
+
+        {:reply, {:ok, record}, state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  defp apply_advance(%State{} = state, issue_id, _opts, :redispatch) do
+    Logger.info("Operator released a blocked issue_id=#{issue_id}; the next poll dispatches it again")
+
+    state = state |> release_issue_claim(issue_id) |> request_poll_now()
+    notify_dashboard()
+
+    {:reply, {:ok, %{issue_id: issue_id}}, state}
+  end
+
+  # One feedback channel serves every gate, so the phase decides what the note
+  # invalidates. Analysis feedback withdraws the approval that would otherwise
+  # send the item straight to implementation; review and summary feedback leave it
+  # in place, because the operator is correcting code or prose, not the plan.
+  defp record_feedback(%State{} = state, issue_id, opts, phase) do
+    case OperatorFeedback.add(issue_id, Keyword.get(opts, :note), Keyword.put(opts, :phase, phase)) do
+      {:ok, note} ->
+        if phase == :analysis do
+          _ = ApprovalStore.revoke(issue_id)
+        end
+
+        # An item parked at the review gate stays there until something releases
+        # it, and feedback is that release: it goes back to running the phase the
+        # note was written against.
+        if DispatchGate.review?(issue_id) do
+          _ = DispatchGate.resume(issue_id, opts)
+        end
+
+        Logger.info("Recorded operator feedback issue_id=#{issue_id} identifier=#{inspect(note.identifier)} phase=#{phase}; next dispatch re-runs #{phase}")
+
+        state = state |> release_for_revision(issue_id) |> request_poll_now()
+
+        {:reply, {:ok, note}, state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  # Feedback belongs to the phase it is criticizing, which is the phase that is
+  # about to re-run — not necessarily the one that produced the parked state.
+  defp feedback_phase(%State{} = state, issue_id) do
+    cond do
+      blocked_reason(state, issue_id) in [:awaiting_analysis_approval, :analysis_incomplete] ->
+        :analysis
+
+      DispatchGate.review?(issue_id) and ApprovalStore.review_approved?(issue_id) ->
+        :summary
+
+      true ->
+        AgentRunner.phase_for(%{id: issue_id})
+    end
+  end
+
+  defp blocked_reason(%State{} = state, issue_id) do
+    case Map.get(state.blocked, issue_id) do
+      %{block_reason: reason} -> reason
+      _ -> nil
+    end
+  end
+
+  @doc false
+  @spec advance_decision_for_test(term(), String.t()) :: atom()
+  def advance_decision_for_test(%State{} = state, issue_id), do: advance_decision(state, issue_id)
+
+  @doc false
+  @spec feedback_phase_for_test(term(), String.t()) :: atom()
+  def feedback_phase_for_test(%State{} = state, issue_id), do: feedback_phase(state, issue_id)
 
   defp tracker_issue_snapshot(%Issue{} = issue) do
     %{

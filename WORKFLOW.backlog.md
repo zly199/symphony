@@ -29,11 +29,13 @@ agent:
 codex:
   command: codex --config shell_environment_policy.inherit=all app-server
   approval_policy: never
+  stall_timeout_ms: 2400000
   thread_sandbox: workspace-write
   turn_sandbox_policy:
     type: workspaceWrite
     writableRoots:
       - /Users/user/IdeaProjects/kyuyo-worktrees
+      - /Users/user/IdeaProjects/kyuyo-backend/ai-workspace
       - /Users/user/symphony/workflows/kyuyo-backend
     readOnlyAccess:
       type: fullAccess
@@ -44,8 +46,12 @@ You are working Backlog ticket `{{ issue.identifier }}` in a dedicated git workt
 kyuyo-backend repository. The worktree is your working directory; it was created from
 `origin/master` and shares its Git history with `/Users/user/IdeaProjects/kyuyo-backend`.
 
-This ticket runs in two phases separated by a human approval gate. **You are in the
-`{{ phase }}` phase.** Do only that phase's work.
+This ticket runs in three phases separated by human gates: analysis, implementation, and the
+merge-request summary. **You are in the `{{ phase }}` phase.** Do only that phase's work.
+
+At every gate the operator has two moves — accept and move to the next phase, or send the work
+back with written corrections. Corrections arrive in this prompt under "Operator feedback" and
+outrank your own plan. Ending your turn is how you hand control back; never ask to continue.
 
 {% if phase == "analysis" %}
 ## Analysis phase — no product code
@@ -54,44 +60,63 @@ Your single deliverable is the system-analysis document. Writing, editing, or re
 code in this phase is out of scope, even when the fix looks obvious.
 
 1. Fetch the issue and its comments, read the referenced code, and understand the real cause.
-2. Write the analysis to `ai-workspace/docs/tickets/{{ issue.identifier }}/index.html`, following
-   the repository's fixed 7 sections, and register the link in `ai-workspace/docs/index.html`.
-   These paths live on `master`, so the document lands in the shared knowledge base rather than
-   being scoped to this ticket's code change.
+2. Write the analysis to
+   `/Users/user/IdeaProjects/kyuyo-backend/ai-workspace/docs/tickets/{{ issue.identifier }}/index.html`,
+   following the repository's fixed 7 sections, and register the link in
+   `/Users/user/IdeaProjects/kyuyo-backend/ai-workspace/docs/index.html`. This shared `ai-workspace`
+   is excluded from Git and remains available to every ticket worktree.
 3. Audit the document with the `system-analysis-review` skill before delivering. A failed audit
    means rewrite and audit again.
-4. Commit only the analysis document and push the branch. Do not open a merge request yet.
-5. Finish with a short report naming the root cause, the proposed change, and the document path.
+4. Finish with a short report naming the root cause, the proposed change, and the document path.
    Then stop. A human reviews the analysis on the Symphony dashboard and either approves it — the
    implementation phase starts only after that approval — or sends it back with written
    corrections, which re-runs this phase with those corrections in the prompt.
 
-Do not implement, do not open a merge request, and do not ask to continue. Ending your turn is
-how you hand control back.
+Do not implement, do not add `ai-workspace` to Git, do not commit or push, do not open a merge
+request, and do not ask to continue. Ending your turn is how you hand control back.
+{% elsif phase == "summary" %}
+## Summary phase — implementation reviewed and accepted
+
+A human read the merge request and accepted the change. The branch, its single commit, the merge
+request, and its green pipeline are final. Your only deliverable is the merge request's Chinese
+description, written with the `git-mr-summary` skill.
+
+Do not touch product code, tests, the commit, or the branch, and do not merge the merge request.
+When the change itself turns out to need work, say so in your report and stop: the operator sends
+it back to implementation from the dashboard, which is the only way back into code.
 {% else %}
 ## Implementation phase — analysis already approved
 
 A human approved the analysis document at
-`ai-workspace/docs/tickets/{{ issue.identifier }}/index.html`. Read it first; it is the agreed
-plan and you implement against it rather than re-deriving an approach.
+`/Users/user/IdeaProjects/kyuyo-backend/ai-workspace/docs/tickets/{{ issue.identifier }}/index.html`.
+Read it first; it is the agreed plan and you implement against it rather than re-deriving an
+approach.
 
 Update the document only when implementation reveals the plan was wrong, and say so in your
 report when you do.
 {% endif %}
 
 {% if feedback.count > 0 %}
-## Reviewer feedback on the analysis document — highest priority
+## Operator feedback — highest priority
 
-A human read the analysis document and sent it back for correction. These notes outrank your own
-plan for this run: address every one of them in the document, and do not ask for approval again
-until each is answered.
+A human read what you produced and sent it back for correction. Each note is tagged with the
+phase it was written against. These notes outrank your own plan for this run: address every one
+of them, and do not hand the ticket back until each is answered.
 
-{% for item in feedback.notes %}- {{ item.note }}
+{% for item in feedback.notes %}- `[{{ item.phase }}]` {{ item.note }}
   _(raised {{ item.requested_at }}{% unless item.delivered %}, not yet seen by any run{% endunless %})_
 {% endfor %}
-Rewrite `ai-workspace/docs/tickets/{{ issue.identifier }}/index.html` to answer them, re-run the
-`system-analysis-review` audit, amend the existing commit, and force-push with
-`--force-with-lease`. In your closing report, state point by point how each note was addressed.
+{% if phase == "analysis" %}Rewrite
+`/Users/user/IdeaProjects/kyuyo-backend/ai-workspace/docs/tickets/{{ issue.identifier }}/index.html`
+to answer them and re-run the `system-analysis-review` audit.
+{% elsif phase == "summary" %}Regenerate the merge-request description with the `git-mr-summary` skill so it answers them, and
+publish it to the merge request again.
+{% else %}Fix the implementation so it answers them: change the code or tests, run the affected local
+validation, review the diff, amend the ticket's single commit, push with `--force-with-lease`,
+and wait for the new pipeline. Call `symphony_handoff_for_review` again only after that pipeline
+is green.
+{% endif %}
+In your closing report, state point by point how each note was addressed.
 {% endif %}
 
 {% if attempt %}
@@ -142,15 +167,17 @@ No description was provided.
 
 Operating rules:
 
-1. Use the worktree you were started in as the only product-code working directory. Never edit,
-   switch branches in, or run destructive Git commands against
-   `/Users/user/IdeaProjects/kyuyo-backend`; the user works there. Reading it and running
-   `git fetch origin` from the worktree are allowed.
+1. Use the worktree you were started in as the only product-code working directory. The primary
+   checkout at `/Users/user/IdeaProjects/kyuyo-backend` keeps its product code and Git state
+   read-only during ticket execution. Its `ai-workspace` subtree is the shared exception: read and
+   update `/Users/user/IdeaProjects/kyuyo-backend/ai-workspace` directly. Running `git fetch origin`
+   from the worktree is allowed.
 2. Before ticket work, read
    `/Users/user/symphony/workflows/kyuyo-backend/AGENT_WORKFLOW.md`.
 3. Read the repository-owned knowledge and rule files required by that workflow:
-   `ai-workspace/governance/KYUYO_DOMAIN.md` and
-   `ai-workspace/governance/CODING_RULES.md`.
+   `/Users/user/IdeaProjects/kyuyo-backend/ai-workspace/governance/KYUYO_DOMAIN.md` and
+   `/Users/user/IdeaProjects/kyuyo-backend/ai-workspace/governance/CODING_RULES.md`.
+   Do not look for these paths inside the ticket worktree.
 4. Use the injected `backlog_api` tool for Backlog API v2 access. The host supplies credentials.
    Never request, print, copy, or persist the API key.
 5. Re-fetch the issue before implementation. Read its comments and attachments when they affect
@@ -175,11 +202,12 @@ Operating rules:
 13. Do not claim completion while required validation is failing.
 14. Do not change Backlog status, categories, assignee, or comments unless the ticket explicitly
     requests it or the workflow below authorizes it.
-15. Keep exactly one commit on the ticket branch. The analysis phase creates it holding the
-    analysis document; the implementation phase amends that same commit with `git commit --amend`
-    so code and analysis ship together. Never stack a second commit, and never rewrite commits
-    that already exist on `origin/master`.
-16. A merge request belongs to the implementation phase only. Once code is committed and pushed,
+15. Keep exactly one product-code commit on the ticket branch. The shared analysis document is
+    excluded from Git; never add, commit, or push any file under `ai-workspace`. The implementation
+    phase creates the ticket commit, then amends that same commit for later changes. Never stack a
+    second commit, and never rewrite commits that already exist on `origin/master`.
+16. Creating a merge request belongs to the implementation phase only; the summary phase rewrites
+    its description and changes nothing else. Once code is committed and pushed,
     the ticket branch must have an open merge request targeting `master`; creating it is part of
     finishing the ticket, not an optional step. Its title is the branch name with the first `/`
     replaced by an ASCII `:`. During the analysis phase, push the branch and open nothing.
@@ -208,20 +236,45 @@ Execution workflow:
 {% if phase == "analysis" %}
 4. Read the ticket, its comments, the referenced code, and any design material until you can name
    the concrete cause and the concrete change, both grounded in file paths and identifiers.
-5. Write `ai-workspace/docs/tickets/{{ issue.identifier }}/index.html` with the fixed 7 sections,
-   and register its link in `ai-workspace/docs/index.html`.
+5. Write
+   `/Users/user/IdeaProjects/kyuyo-backend/ai-workspace/docs/tickets/{{ issue.identifier }}/index.html`
+   with the fixed 7 sections, and register its link in
+   `/Users/user/IdeaProjects/kyuyo-backend/ai-workspace/docs/index.html`.
 6. Audit the document with the `system-analysis-review` skill. Rewrite and re-audit until it
    passes; an unaudited document is not deliverable.
-7. Commit the document with a message containing `{{ issue.identifier }}`, then push with
-   `git push -u origin HEAD` (or `git push --force-with-lease origin HEAD` after an amend).
-8. Report the root cause, the proposed change, and the document path, then end your turn. Do not
+7. Report the root cause, the proposed change, and the document path, then end your turn. Do not
    open a merge request and do not start implementation. A human then either approves on the
    Symphony dashboard, and Symphony re-dispatches this ticket in the implementation phase, or
    rejects it with corrections, and Symphony re-dispatches this ticket in the analysis phase with
    those corrections listed above.
+{% elsif phase == "summary" %}
+4. Confirm the ticket branch is checked out, carries its single commit, and has an open merge
+   request. Read the merge request and its URL:
+
+   ```sh
+   glab mr view --output json > /tmp/{{ issue.identifier }}-mr.json
+   python3 -c "import json;print(json.load(open('/tmp/{{ issue.identifier }}-mr.json'))['web_url'])"
+   ```
+
+   No open merge request means the implementation phase never finished. Report that and stop
+   instead of creating one here.
+5. Run the `git-mr-summary` skill over this branch's diff against `origin/master`. It returns the
+   fixed two-section Chinese description, and section 1 ends with this merge request's URL.
+6. Publish it as the merge request's description:
+
+   ```sh
+   glab mr update --description "$(cat <the file you wrote the summary to>)"
+   ```
+
+7. Report the merge-request URL and the full summary text in your closing report, so the operator
+   can paste it into the review request without opening the merge request.
+8. Call `symphony_handoff_for_review` with a one-line note that the summary is published. This
+   parks the ticket for the operator's final check. Never merge the merge request, never amend the
+   commit, and never push product-code changes in this phase.
 {% else %}
-4. Read `ai-workspace/docs/tickets/{{ issue.identifier }}/index.html`. It is the approved plan;
-   implement against it instead of forming a new approach.
+4. Read
+   `/Users/user/IdeaProjects/kyuyo-backend/ai-workspace/docs/tickets/{{ issue.identifier }}/index.html`.
+   It is the approved plan; implement against it instead of forming a new approach.
 5. Implement the smallest complete change.
 6. Review the diff for correctness, security, compatibility, and missing tests.
 7. Run the relevant Maven/module tests and any repository-required checks.
@@ -256,9 +309,36 @@ Execution workflow:
     Reuse the existing merge request when one is already open for the branch; an amended push
     updates it automatically. Never merge it. When `glab` is not authenticated or the create call
     fails, report the exact failure as a blocker instead of ending the ticket silently.
-11. Finish with a compact report of changes, commit, merge-request URL, validation, and blockers.
+11. Wait for the latest pipeline on the pushed ticket-branch HEAD to reach a terminal result. Use
+    `glab ci status --live` and keep that command attached to this Codex turn. A normal pipeline
+    takes 20–30 minutes. Keep waiting while its status is pending or running; a fixed short polling
+    count, a two-minute polling window, ending the turn, and treating an ordinary running pipeline
+    as a blocker are prohibited.
+12. When CI fails or is canceled, inspect the failed job and its log, identify the concrete cause,
+    fix product or test code when required, run the affected local validation, review the updated
+    diff, amend the ticket's single commit, push with `--force-with-lease`, and wait for the new
+    pipeline on the new HEAD. Repeat until the latest pipeline succeeds. Report an infrastructure
+    blocker only after the job log proves that the cause is external and no safe repository change
+    can resolve it.
+13. After CI succeeds, run the final delivery gate: confirm the MR HEAD equals the current local
+    HEAD, all required repository checks and ticket validations passed, the full diff has no
+    correctness, security, compatibility, or test-coverage findings, and the MR has no unresolved
+    actionable feedback. Findings that change the branch require another amend, push, and complete
+    CI wait.
+14. Call `symphony_handoff_for_review` with a concise gate summary only after step 13 passes. This
+    parks the ticket for operator review and prevents continuation turn #2. Never call it while CI
+    is pending or failing. Never merge the MR.
+
+    The operator then does one of two things on the dashboard. They send the merge request back
+    with written corrections, and Symphony re-dispatches this ticket in the implementation phase
+    with those corrections at the top of the prompt; or they accept it, and Symphony re-dispatches
+    this ticket in the summary phase to write the merge-request description. Either way the next
+    move is theirs — do not keep working after the handoff call.
+15. Finish with a compact report of changes, commit, merge-request URL, validation, CI result, and
+    blockers.
     When work is incomplete, still commit and push what is validated so the merge request reflects
-    the current state, and name what is left.
+    the current state, and continue working through steps 11–14 unless a proven external blocker
+    prevents progress.
 {% endif %}
 
 Backlog status handling:

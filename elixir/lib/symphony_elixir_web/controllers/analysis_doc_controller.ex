@@ -1,11 +1,10 @@
 defmodule SymphonyElixirWeb.AnalysisDocController do
   @moduledoc """
-  Serves a work item's analysis document straight out of its workspace.
+  Serves a work item's analysis document from the shared knowledge base.
 
-  The document is produced inside the ticket's worktree and never reaches the
-  operator's own checkout until the branch merges, so the dashboard needs a way
-  to open it in place. The whole `ai-workspace/docs` tree is served under one
-  prefix, which keeps the document's own relative asset links working.
+  Repository-backed worktree workflows store `ai-workspace` in the source
+  checkout outside Git. The whole shared `ai-workspace/docs` tree is served
+  under one prefix, which keeps the document's relative asset links working.
   """
 
   use Phoenix.Controller, formats: []
@@ -37,7 +36,7 @@ defmodule SymphonyElixirWeb.AnalysisDocController do
   end
 
   @doc """
-  Serves one file from the work item's `ai-workspace/docs` tree.
+  Serves one file from the shared `ai-workspace/docs` tree.
   """
   @spec asset(Conn.t(), map()) :: Conn.t()
   def asset(conn, %{"workspace_key" => workspace_key, "path" => segments}) do
@@ -71,12 +70,12 @@ defmodule SymphonyElixirWeb.AnalysisDocController do
   @spec doc_exists?(String.t() | nil) :: boolean()
   defdelegate doc_exists?(identifier), to: AnalysisDoc, as: :exists?
 
-  # The worktree wins, since that is where this ticket's own document lives.
-  # Shared assets usually exist only in the source repository, so that is tried
-  # next; both roots are resolved the same guarded way.
+  # The source repository owns the shared knowledge base. The worktree remains
+  # a compatibility fallback for workflows without shared repository docs.
   defp locate(workspace_key, segments) do
-    with {:error, _worktree_reason} <- locate_in(AnalysisDoc.docs_root(workspace_key), segments) do
-      locate_in(AnalysisDoc.repository_docs_root(), segments)
+    with {:error, _repository_reason} <-
+           locate_in(AnalysisDoc.repository_docs_root(), segments) do
+      locate_in(AnalysisDoc.docs_root(workspace_key), segments)
     end
   end
 

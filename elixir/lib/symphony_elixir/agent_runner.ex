@@ -5,12 +5,26 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{AnalysisFeedback, ApprovalStore, Config, PromptBuilder, ResumeState, Tracker, Workspace}
+
+  alias SymphonyElixir.{
+    ApprovalStore,
+    Config,
+    DispatchGate,
+    OperatorFeedback,
+    PromptBuilder,
+    ResumeState,
+    Tracker,
+    Workspace
+  }
 
   # Analysis is a bounded deliverable, so it gets far fewer turns than
   # implementation. The cap also stops an unapproved ticket from spending a full
   # run's budget before it reaches the operator.
   @analysis_max_turns 3
+  # The summary phase reads a finished branch and writes a merge-request
+  # description. Nothing about it should take a long run, and a cap keeps a
+  # confused agent from re-opening implementation work under a summary prompt.
+  @summary_max_turns 3
   alias SymphonyElixir.Tracker.Issue
 
   @type worker_host :: String.t() | nil
@@ -173,17 +187,23 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   @doc """
-  Returns the phase a work item runs in: `:analysis` until an operator approves
-  it, `:implementation` afterwards.
+  Returns the phase a work item runs in, which is decided entirely by the operator
+  gates it has passed: `:analysis` until the analysis is approved,
+  `:implementation` until the post-CI review is approved, `:summary` afterwards.
   """
-  @spec phase_for(Issue.t() | map()) :: :analysis | :implementation
+  @spec phase_for(Issue.t() | map()) :: :analysis | :implementation | :summary
   def phase_for(%{id: issue_id}) do
-    if ApprovalStore.approved?(issue_id), do: :implementation, else: :analysis
+    cond do
+      not ApprovalStore.approved?(issue_id) -> :analysis
+      ApprovalStore.review_approved?(issue_id) -> :summary
+      true -> :implementation
+    end
   end
 
   def phase_for(_issue), do: :analysis
 
   defp phase_max_turns(:analysis, configured), do: min(configured, @analysis_max_turns)
+  defp phase_max_turns(:summary, configured), do: min(configured, @summary_max_turns)
   defp phase_max_turns(_phase, configured), do: configured
 
   # A restarted orchestrator dispatches turn 1 again with no memory of prior
@@ -201,11 +221,11 @@ defmodule SymphonyElixir.AgentRunner do
     Keyword.put(opts, :resume, resume)
   end
 
-  # An operator who rejected the analysis wrote down what is wrong with it, and
-  # that text is the highest-priority input for the next run, so it travels in
-  # the opening prompt rather than waiting for a human to repeat it.
+  # An operator who sent work back wrote down what is wrong with it, and that
+  # text is the highest-priority input for the next run, so it travels in the
+  # opening prompt rather than waiting for a human to repeat it.
   defp put_review_feedback(opts, %{id: issue_id}) when is_binary(issue_id) do
-    notes = AnalysisFeedback.notes(issue_id)
+    notes = OperatorFeedback.notes(issue_id)
     pending = Enum.count(notes, &is_nil(&1.delivered_at))
 
     if notes != [] do
@@ -218,29 +238,33 @@ defmodule SymphonyElixir.AgentRunner do
   defp put_review_feedback(opts, _issue), do: Keyword.put(opts, :feedback, [])
 
   defp mark_review_feedback_delivered(%{id: issue_id}) when is_binary(issue_id) do
-    AnalysisFeedback.mark_delivered(issue_id)
+    OperatorFeedback.mark_delivered(issue_id)
   end
 
   defp mark_review_feedback_delivered(_issue), do: :ok
 
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
-    case issue_state_fetcher.([issue_id]) do
-      {:ok, [%Issue{} = refreshed_issue | _]} ->
-        if open_issue_state?(refreshed_issue.state) and issue_routable?(refreshed_issue) do
-          {:continue, refreshed_issue}
-        else
-          {:done, refreshed_issue}
-        end
-
-      {:ok, []} ->
-        {:done, issue}
-
-      {:error, reason} ->
-        {:error, {:issue_state_refresh_failed, reason}}
+    if DispatchGate.review?(issue_id) do
+      {:done, issue}
+    else
+      continue_with_refreshed_issue(issue, issue_state_fetcher.([issue_id]))
     end
   end
 
   defp continue_with_issue?(issue, _issue_state_fetcher), do: {:done, issue}
+
+  defp continue_with_refreshed_issue(_issue, {:ok, [%Issue{} = refreshed_issue | _]}) do
+    if open_issue_state?(refreshed_issue.state) and issue_routable?(refreshed_issue) do
+      {:continue, refreshed_issue}
+    else
+      {:done, refreshed_issue}
+    end
+  end
+
+  defp continue_with_refreshed_issue(issue, {:ok, []}), do: {:done, issue}
+
+  defp continue_with_refreshed_issue(_issue, {:error, reason}),
+    do: {:error, {:issue_state_refresh_failed, reason}}
 
   # Turns keep coming until the ticket is finished. Which open column it sits in
   # is not the runner's business: the operator's start released this work, and only

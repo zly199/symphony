@@ -3,7 +3,15 @@ defmodule SymphonyElixirWeb.Presenter do
   Shared projections for the observability API and dashboard.
   """
 
-  alias SymphonyElixir.{AnalysisFeedback, Config, DispatchGate, Orchestrator, StatusDashboard, Workspace}
+  alias SymphonyElixir.{
+    ApprovalStore,
+    Config,
+    DispatchGate,
+    OperatorFeedback,
+    Orchestrator,
+    StatusDashboard,
+    Workspace
+  }
 
   @spec state_payload(GenServer.name(), timeout()) :: map()
   def state_payload(orchestrator, snapshot_timeout_ms) do
@@ -11,11 +19,18 @@ defmodule SymphonyElixirWeb.Presenter do
 
     case Orchestrator.snapshot(orchestrator, snapshot_timeout_ms) do
       %{} = snapshot ->
-        # The gate is read once per payload: the dashboard needs a run status on
-        # every tracker row and every blocked row, and they all come from one file.
+        # The gate and the review approvals are read once per payload: the
+        # dashboard needs a run status and a review decision on every tracker row
+        # and every blocked row, and they all come from two files.
         gate_statuses = DispatchGate.statuses()
-        tracker = tracker_payload(Map.get(snapshot, :tracker), snapshot, gate_statuses)
-        blocked = Enum.map(Map.get(snapshot, :blocked, []), &blocked_entry_payload(&1, gate_statuses))
+        review_approved = ApprovalStore.review_approved_ids()
+        tracker = tracker_payload(Map.get(snapshot, :tracker), snapshot, gate_statuses, review_approved)
+
+        blocked =
+          Enum.map(
+            Map.get(snapshot, :blocked, []),
+            &blocked_entry_payload(&1, gate_statuses, review_approved)
+          )
 
         %{
           generated_at: generated_at,
@@ -145,7 +160,7 @@ defmodule SymphonyElixirWeb.Presenter do
     }
   end
 
-  defp blocked_entry_payload(entry, gate_statuses) do
+  defp blocked_entry_payload(entry, gate_statuses, review_approved) do
     %{
       issue_id: entry.issue_id,
       issue_identifier: entry.identifier,
@@ -154,7 +169,8 @@ defmodule SymphonyElixirWeb.Presenter do
       error: entry.error,
       block_reason: Map.get(entry, :block_reason, :input_required),
       run_status: run_status(gate_statuses, entry.issue_id),
-      analysis_feedback: analysis_feedback_payload(entry.issue_id),
+      review_approved: MapSet.member?(review_approved, entry.issue_id),
+      feedback: feedback_payload(entry.issue_id),
       worker_host: Map.get(entry, :worker_host),
       workspace_path: Map.get(entry, :workspace_path),
       session_id: entry.session_id,
@@ -168,12 +184,13 @@ defmodule SymphonyElixirWeb.Presenter do
 
   # Feedback the operator already sent is what tells them whether their last
   # correction reached a run, so it travels with the blocked entry itself.
-  defp analysis_feedback_payload(issue_id) do
+  defp feedback_payload(issue_id) do
     issue_id
-    |> AnalysisFeedback.notes()
+    |> OperatorFeedback.notes()
     |> Enum.map(fn note ->
       %{
         note: note.note,
+        phase: note.phase,
         requested_at: note.requested_at,
         requested_by: note.requested_by,
         delivered: not is_nil(note.delivered_at)
@@ -181,7 +198,7 @@ defmodule SymphonyElixirWeb.Presenter do
     end)
   end
 
-  defp tracker_payload(tracker, snapshot, gate_statuses) when is_map(tracker) do
+  defp tracker_payload(tracker, snapshot, gate_statuses, review_approved) when is_map(tracker) do
     runtime_statuses = tracker_runtime_statuses(snapshot)
 
     %{
@@ -191,11 +208,11 @@ defmodule SymphonyElixirWeb.Presenter do
       issues:
         tracker
         |> Map.get(:issues, [])
-        |> Enum.map(&tracker_issue_payload(&1, runtime_statuses, gate_statuses))
+        |> Enum.map(&tracker_issue_payload(&1, runtime_statuses, gate_statuses, review_approved))
     }
   end
 
-  defp tracker_payload(_tracker, _snapshot, _gate_statuses) do
+  defp tracker_payload(_tracker, _snapshot, _gate_statuses, _review_approved) do
     %{source: nil, active_states: [], synced_at: nil, issues: []}
   end
 
@@ -211,7 +228,7 @@ defmodule SymphonyElixirWeb.Presenter do
     |> Map.new()
   end
 
-  defp tracker_issue_payload(issue, runtime_statuses, gate_statuses) do
+  defp tracker_issue_payload(issue, runtime_statuses, gate_statuses, review_approved) do
     issue_id = Map.get(issue, :issue_id)
     run_status = run_status(gate_statuses, issue_id)
 
@@ -226,18 +243,25 @@ defmodule SymphonyElixirWeb.Presenter do
       assignee_id: Map.get(issue, :assignee_id),
       updated_at: iso8601(Map.get(issue, :updated_at)),
       run_status: run_status,
+      review_approved: MapSet.member?(review_approved, issue_id),
       # What the orchestrator is doing with the item only matters once the operator
       # has released it; before that the row's own gate status is the honest answer.
-      runtime_status: runtime_status(run_status, runtime_statuses, issue_id)
+      runtime_status:
+        runtime_status(run_status, runtime_statuses, issue_id, MapSet.member?(review_approved, issue_id))
     }
   end
 
   defp run_status(gate_statuses, issue_id), do: Map.get(gate_statuses, issue_id, :waiting)
 
-  defp runtime_status(:waiting, _runtime_statuses, _issue_id), do: "waiting"
-  defp runtime_status(:paused, _runtime_statuses, _issue_id), do: "paused"
+  defp runtime_status(:waiting, _runtime_statuses, _issue_id, _review_approved), do: "waiting"
+  defp runtime_status(:paused, _runtime_statuses, _issue_id, _review_approved), do: "paused"
 
-  defp runtime_status(:started, runtime_statuses, issue_id),
+  # The review gate is reached twice, and which side of the summary run an item is
+  # on is the difference between "read this diff" and "merge it".
+  defp runtime_status(:review, _runtime_statuses, _issue_id, true), do: "merge_pending"
+  defp runtime_status(:review, _runtime_statuses, _issue_id, _review_approved), do: "review"
+
+  defp runtime_status(:started, runtime_statuses, issue_id, _review_approved),
     do: Map.get(runtime_statuses, issue_id, "queued")
 
   defp running_issue_payload(running) do
