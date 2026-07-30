@@ -21,6 +21,19 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.openai.symphony.back
 launchctl bootout gui/$(id -u)/com.openai.symphony.backlog
 ```
 
+**源码更新后重新编译：**
+
+```bash
+./compile_symphony_backlog.sh
+```
+
+编译完成后，重新启动 LaunchAgent：
+
+```bash
+launchctl bootout gui/$(id -u)/com.openai.symphony.backlog 2>/dev/null || true
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.openai.symphony.backlog.plist
+```
+
 **查看是否在跑**（有输出即在跑，第一列是 PID）：
 
 ```bash
