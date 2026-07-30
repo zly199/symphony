@@ -5,6 +5,7 @@ defmodule SymphonyElixir.ExtensionsTest do
   import Phoenix.LiveViewTest
 
   alias SymphonyElixir.AnalysisFeedback
+  alias SymphonyElixir.DispatchGate
   alias SymphonyElixir.Linear.Adapter
   alias SymphonyElixir.Tracker.Memory
 
@@ -228,6 +229,40 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert SymphonyElixir.Tracker.bind_agent_tools().secret_environment_names == ["LINEAR_API_KEY"]
   end
 
+  test "intake asks the adapter for open work and says so when a state write is unsupported" do
+    open_issue = %Issue{id: "issue-open", identifier: "MT-OPEN", state: "Open"}
+    closed_issue = %Issue{id: "issue-closed", identifier: "MT-CLOSED", state: "Closed"}
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [open_issue, closed_issue])
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["In Progress"],
+      tracker_terminal_states: ["Closed"]
+    )
+
+    # Intake is not the active-state list: an "Open" ticket enters, a closed one
+    # does not, without either name appearing in `active_states`.
+    assert {:ok, [^open_issue]} = SymphonyElixir.Tracker.fetch_intake_issues()
+
+    assert {:ok, %Issue{state: "In Progress"}} =
+             SymphonyElixir.Tracker.update_issue_state(open_issue, "In Progress")
+
+    assert {:ok, [%Issue{state: "In Progress"}, %Issue{state: "Closed"}]} =
+             SymphonyElixir.Tracker.fetch_issues_by_ids(["issue-open", "issue-closed"])
+
+    # A tracker with no native open-issue read falls back to the configured states,
+    # and one with no state write says which tracker refused instead of pretending.
+    Application.put_env(:symphony_elixir, :linear_client_module, FakeLinearClient)
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "linear")
+
+    assert {:ok, ["Todo", "In Progress"]} = SymphonyElixir.Tracker.fetch_intake_issues()
+    assert_receive {:fetch_issues_by_states_called, ["Todo", "In Progress"]}
+
+    assert {:error, {:unsupported_tracker_state_write, "linear"}} =
+             SymphonyElixir.Tracker.update_issue_state(open_issue, "In Progress")
+  end
+
   test "linear adapter delegates reads and advertises its native agent tool" do
     Application.put_env(:symphony_elixir, :linear_client_module, FakeLinearClient)
 
@@ -267,7 +302,9 @@ defmodule SymphonyElixir.ExtensionsTest do
                "tracker_active" => 1,
                "running" => 1,
                "retrying" => 1,
-               "blocked" => 1
+               "blocked" => 1,
+               "waiting" => 1,
+               "paused" => 0
              },
              "tracker" => %{
                "source" => "backlog",
@@ -287,6 +324,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                      state_payload["tracker"]["issues"]
                      |> List.first()
                      |> Map.fetch!("updated_at"),
+                   "run_status" => "waiting",
                    "runtime_status" => "waiting"
                  }
                ]
@@ -331,6 +369,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "state" => "In Progress",
                  "error" => "codex turn requires operator input",
                  "block_reason" => "input_required",
+                 "run_status" => "waiting",
                  "analysis_feedback" => [],
                  "worker_host" => "dm-dev2",
                  "workspace_path" => "/workspaces/MT-BLOCKED",
@@ -561,9 +600,10 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Codex 动态"
     assert html =~ "速率限制"
     assert html =~ "重试队列"
-    assert html =~ "Backlog 当前票"
+    assert html =~ "Backlog 待处理票"
     assert html =~ "Backlog tracked issue"
     assert html =~ "等待调度"
+    assert html =~ "开始调度"
     refute html =~ "data-runtime-clock="
     refute html =~ "setInterval(refreshRuntimeClocks"
     refute html =~ "Refresh now"
@@ -649,6 +689,71 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert length(AnalysisFeedback.notes("issue-blocked")) == 1
   end
 
+  test "dashboard liveview walks a ticket from waiting through started and paused" do
+    orchestrator_name = Module.concat(__MODULE__, :GateDashboardOrchestrator)
+    snapshot = static_snapshot()
+
+    # Park the ticket at the analysis gate: this is where an operator decides the
+    # thing is going nowhere, so it is where pausing has to work.
+    gated_snapshot =
+      put_in(snapshot.blocked, [
+        snapshot.blocked
+        |> List.first()
+        |> Map.put(:block_reason, :awaiting_analysis_approval)
+      ])
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(name: orchestrator_name, snapshot: gated_snapshot)
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    {:ok, view, _html} = live(build_conn(), "/")
+
+    assert has_element?(view, "form.revision-form")
+
+    # Nothing has been released yet, so every row offers a start and no row offers
+    # a way to stop something that is not running.
+    assert has_element?(view, gate_button("start_issue", "issue-tracked"))
+    assert has_element?(view, gate_button("start_issue", "issue-blocked"))
+    refute has_element?(view, gate_button("pause_issue", "issue-blocked"))
+    refute has_element?(view, gate_button("resume_issue", "issue-blocked"))
+
+    html = click_gate(view, "start_issue")
+
+    assert html =~ "已开始调度 MT-BLOCKED"
+    assert DispatchGate.started?("issue-blocked")
+    assert has_element?(view, gate_button("pause_issue", "issue-blocked"))
+    refute has_element?(view, gate_button("start_issue", "issue-blocked"))
+
+    html = click_gate(view, "pause_issue")
+
+    assert html =~ "已暂停 MT-BLOCKED"
+    assert DispatchGate.paused?("issue-blocked")
+    assert has_element?(view, gate_button("resume_issue", "issue-blocked"))
+    refute has_element?(view, gate_button("pause_issue", "issue-blocked"))
+
+    # A paused ticket is out of the rotation, so the analysis gate stops asking
+    # for a decision on it.
+    refute has_element?(view, "form.revision-form")
+
+    html = click_gate(view, "resume_issue")
+
+    assert html =~ "已恢复 MT-BLOCKED"
+    assert DispatchGate.started?("issue-blocked")
+    assert has_element?(view, gate_button("pause_issue", "issue-blocked"))
+    refute has_element?(view, gate_button("resume_issue", "issue-blocked"))
+  end
+
+  defp gate_button(event, issue_id) do
+    "button[phx-click=#{event}][phx-value-issue-id=#{issue_id}]"
+  end
+
+  defp click_gate(view, event) do
+    view
+    |> element(gate_button(event, "issue-blocked"))
+    |> render_click()
+  end
+
   defp submit_revision(view, note) do
     view
     |> element("form.revision-form")
@@ -705,7 +810,9 @@ defmodule SymphonyElixir.ExtensionsTest do
              "tracker_active" => 1,
              "running" => 1,
              "retrying" => 1,
-             "blocked" => 1
+             "blocked" => 1,
+             "waiting" => 1,
+             "paused" => 0
            }
 
     dashboard_css = Req.get!("http://127.0.0.1:#{port}/dashboard.css")

@@ -83,12 +83,15 @@ Important boundary:
    - Performs validation used by the orchestrator before dispatch.
 
 3. `Issue Tracker Adapter`
-   - Fetches candidate issues in active states.
+   - Fetches candidate issues in active states, or every non-terminal issue when dispatch is
+     operator-gated (see 8.2).
    - Fetches current states for specific issue IDs (reconciliation).
    - Fetches terminal-state issues during startup cleanup.
    - Normalizes tracker payloads into a stable issue model.
    - MAY expose provider-native agent tools without adding provider-specific write APIs to the
      orchestrator.
+   - MAY expose a single scheduler-owned state write so an operator-gated release can move the issue
+     into its start state; ticket writes otherwise stay with the coding agent.
 
 4. `Orchestrator`
    - Owns the poll tick.
@@ -746,7 +749,8 @@ Tick sequence:
 
 1. Reconcile running issues.
 2. Run dispatch preflight validation.
-3. Fetch candidate issues from tracker using active states.
+3. Fetch candidate issues from tracker using active states, or every non-terminal state when the
+   implementation admits work through an operator gate (see 8.2).
 4. Sort issues by dispatch priority.
 5. Dispatch eligible issues while slots remain.
 6. Notify observability/status consumers of state changes.
@@ -759,7 +763,12 @@ first.
 An issue is dispatch-eligible only if all are true:
 
 - It has `id`, `identifier`, `title`, and `state`.
-- Its state is in `active_states` and not in `terminal_states`.
+- Its state is in `active_states` and not in `terminal_states`. An implementation MAY replace the
+  `active_states` requirement with an explicit operator gate (an operator-confirmation policy, which
+  this specification leaves implementation-defined): intake then covers every non-terminal state and
+  dispatch requires a recorded, durable per-issue release. An implementation that does so MUST
+  document the gate, MUST NOT dispatch an unreleased issue, and MUST still exclude
+  `terminal_states`.
 - Its adapter-provided `dispatchable` value is `true`.
 - It contains every label in `tracker.required_labels`.
 - It is not already in `running`.
@@ -1868,7 +1877,7 @@ on_tick(state):
     schedule_tick(state.poll_interval_ms)
     return state
 
-  issues = tracker.fetch_issues_by_states(active_states)
+  issues = tracker.fetch_intake_issues()   # active_states, or all non-terminal states when gated
   if issues failed:
     log_tracker_error()
     notify_observers()
@@ -1905,7 +1914,7 @@ function reconcile_running_issues(state):
   for issue in refreshed:
     if issue.state in terminal_states:
       state = terminate_running_issue(state, issue.id, cleanup_workspace=true)
-    else if issue.state in active_states and issue_routable(issue):
+    else if issue_routable(issue) and issue_state_permits_running(issue):
       state.running[issue.id].issue = issue
     else:
       state = terminate_running_issue(state, issue.id, cleanup_workspace=false)
@@ -1916,6 +1925,10 @@ function reconcile_running_issues(state):
 
   return state
 ```
+
+`issue_state_permits_running(issue)` means `issue.state in active_states`, or — for an implementation
+that gates dispatch on an operator release (8.2) — that the state is simply not terminal, since the
+release rather than the tracker column is what admits the run.
 
 ### 16.4 Dispatch One Issue
 

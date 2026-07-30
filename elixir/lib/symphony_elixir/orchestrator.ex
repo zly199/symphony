@@ -13,6 +13,7 @@ defmodule SymphonyElixir.Orchestrator do
     AnalysisFeedback,
     ApprovalStore,
     Config,
+    DispatchGate,
     StatusDashboard,
     Tracker,
     Workspace
@@ -38,6 +39,7 @@ defmodule SymphonyElixir.Orchestrator do
   ]
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
+  @paused_error "paused by the operator; no further runs until it is resumed"
   @empty_codex_totals %{
     input_tokens: 0,
     output_tokens: 0,
@@ -234,6 +236,9 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp handle_agent_down(:normal, state, issue_id, running_entry, session_id) do
     cond do
+      DispatchGate.paused?(issue_id) ->
+        block_paused_agent_down(state, issue_id, running_entry, session_id)
+
       input_required_blocker?(running_entry) ->
         block_input_required_agent_down(state, issue_id, running_entry, session_id, :normal)
 
@@ -246,11 +251,26 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_agent_down(reason, state, issue_id, running_entry, session_id) do
-    if input_required_blocker?(running_entry) do
-      block_input_required_agent_down(state, issue_id, running_entry, session_id, reason)
-    else
-      retry_agent_down(state, issue_id, running_entry, session_id, reason)
+    cond do
+      # A pause outranks the retry ladder: an exit that would normally be retried
+      # is the operator's cue that this item is going nowhere.
+      DispatchGate.paused?(issue_id) ->
+        block_paused_agent_down(state, issue_id, running_entry, session_id)
+
+      input_required_blocker?(running_entry) ->
+        block_input_required_agent_down(state, issue_id, running_entry, session_id, reason)
+
+      true ->
+        retry_agent_down(state, issue_id, running_entry, session_id, reason)
     end
+  end
+
+  defp block_paused_agent_down(state, issue_id, running_entry, session_id) do
+    Logger.info("Agent task parked for paused issue: issue_id=#{issue_id} issue_identifier=#{Map.get(running_entry, :identifier)} session_id=#{session_id}")
+
+    state
+    |> block_issue_from_entry(issue_id, running_entry, @paused_error, :operator_paused)
+    |> stamp_pause_time(issue_id)
   end
 
   # The analysis phase ends at an operator decision, not at a tracker state
@@ -384,12 +404,14 @@ defmodule SymphonyElixir.Orchestrator do
       |> reconcile_blocked_issues()
 
     with :ok <- Config.validate!(),
-         {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states) do
+         {:ok, issues} <- Tracker.fetch_intake_issues() do
       state = %{
         state
         | tracker_issues: issues,
           tracker_synced_at: DateTime.utc_now()
       }
+
+      state = park_paused_issues(state, issues)
 
       if available_slots(state) > 0 do
         choose_issues(issues, state)
@@ -447,11 +469,7 @@ defmodule SymphonyElixir.Orchestrator do
       case Tracker.fetch_issues_by_ids(running_ids) do
         {:ok, issues} ->
           issues
-          |> reconcile_running_issue_states(
-            state,
-            active_state_set(),
-            terminal_state_set()
-          )
+          |> reconcile_running_issue_states(state, terminal_state_set())
           |> reconcile_missing_running_issue_ids(running_ids, issues)
 
         {:error, reason} ->
@@ -471,11 +489,7 @@ defmodule SymphonyElixir.Orchestrator do
       case Tracker.fetch_issues_by_ids(blocked_ids) do
         {:ok, issues} ->
           issues
-          |> reconcile_blocked_issue_states(
-            state,
-            active_state_set(),
-            terminal_state_set()
-          )
+          |> reconcile_blocked_issue_states(state, terminal_state_set())
           |> reconcile_missing_blocked_issue_ids(blocked_ids, issues)
 
         {:error, reason} ->
@@ -489,17 +503,17 @@ defmodule SymphonyElixir.Orchestrator do
   @doc false
   @spec reconcile_issue_states_for_test([Issue.t()], term()) :: term()
   def reconcile_issue_states_for_test(issues, %State{} = state) when is_list(issues) do
-    reconcile_running_issue_states(issues, state, active_state_set(), terminal_state_set())
+    reconcile_running_issue_states(issues, state, terminal_state_set())
   end
 
   def reconcile_issue_states_for_test(issues, state) when is_list(issues) do
-    reconcile_running_issue_states(issues, state, active_state_set(), terminal_state_set())
+    reconcile_running_issue_states(issues, state, terminal_state_set())
   end
 
   @doc false
   @spec reconcile_blocked_issue_states_for_test([Issue.t()], term()) :: term()
   def reconcile_blocked_issue_states_for_test(issues, %State{} = state) when is_list(issues) do
-    reconcile_blocked_issue_states(issues, state, active_state_set(), terminal_state_set())
+    reconcile_blocked_issue_states(issues, state, terminal_state_set())
   end
 
   @doc false
@@ -528,7 +542,7 @@ defmodule SymphonyElixir.Orchestrator do
   @doc false
   @spec should_dispatch_issue_for_test(Issue.t(), term()) :: boolean()
   def should_dispatch_issue_for_test(%Issue{} = issue, %State{} = state) do
-    should_dispatch_issue?(issue, state, active_state_set(), terminal_state_set())
+    should_dispatch_issue?(issue, state, terminal_state_set())
   end
 
   @doc false
@@ -552,22 +566,26 @@ defmodule SymphonyElixir.Orchestrator do
     select_worker_host(state, preferred_worker_host)
   end
 
-  defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
+  defp reconcile_running_issue_states([], state, _terminal_states), do: state
 
-  defp reconcile_running_issue_states([issue | rest], state, active_states, terminal_states) do
+  defp reconcile_running_issue_states([issue | rest], state, terminal_states) do
     reconcile_running_issue_states(
       rest,
-      reconcile_issue_state(issue, state, active_states, terminal_states),
-      active_states,
+      reconcile_issue_state(issue, state, terminal_states),
       terminal_states
     )
   end
 
-  defp reconcile_issue_state(%Issue{} = issue, state, active_states, terminal_states) do
+  # A run ends when the ticket is finished or is no longer ours. It does not end
+  # because someone moved the ticket between open states: the operator's start,
+  # pause, and the tracker's terminal states are the signals now, and treating a
+  # column change as "stop" would kill runs the operator explicitly began.
+  defp reconcile_issue_state(%Issue{} = issue, state, terminal_states) do
     cond do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
+        forget_dispatch_gate(issue.id)
         terminate_running_issue(state, issue.id, true)
 
       !issue_routable?(issue) ->
@@ -575,59 +593,60 @@ defmodule SymphonyElixir.Orchestrator do
 
         terminate_running_issue(state, issue.id, false)
 
-      active_issue_state?(issue.state, active_states) ->
-        refresh_running_issue_state(state, issue)
-
       true ->
-        Logger.info("Issue moved to non-active state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
-
-        terminate_running_issue(state, issue.id, false)
+        refresh_running_issue_state(state, issue)
     end
   end
 
-  defp reconcile_issue_state(_issue, state, _active_states, _terminal_states), do: state
+  defp reconcile_issue_state(_issue, state, _terminal_states), do: state
 
-  defp reconcile_blocked_issue_states([], state, _active_states, _terminal_states), do: state
+  defp reconcile_blocked_issue_states([], state, _terminal_states), do: state
 
-  defp reconcile_blocked_issue_states([issue | rest], state, active_states, terminal_states) do
+  defp reconcile_blocked_issue_states([issue | rest], state, terminal_states) do
     reconcile_blocked_issue_states(
       rest,
-      reconcile_blocked_issue_state(issue, state, active_states, terminal_states),
-      active_states,
+      reconcile_blocked_issue_state(issue, state, terminal_states),
       terminal_states
     )
   end
 
-  defp reconcile_blocked_issue_state(%Issue{} = issue, state, active_states, terminal_states) do
+  defp reconcile_blocked_issue_state(%Issue{} = issue, state, terminal_states) do
     cond do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Blocked issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; releasing block")
 
         cleanup_issue_workspace(issue, Map.get(state.blocked, issue.id, %{}))
+        forget_dispatch_gate(issue.id)
         release_issue_claim(state, issue.id)
+
+      # Nothing but an explicit resume clears a pause, so the checks below that
+      # release a block on their own do not get a say here.
+      DispatchGate.paused?(issue.id) ->
+        refresh_blocked_issue_state(state, issue)
 
       !issue_routable?(issue) ->
         Logger.info("Blocked issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; releasing block")
 
         release_issue_claim(state, issue.id)
 
-      active_issue_state?(issue.state, active_states) ->
-        if idle_block_released?(Map.get(state.blocked, issue.id), issue) do
-          Logger.info("Blocked issue saw tracker progress: #{issue_context(issue)} updated_at=#{inspect(issue.updated_at)}; releasing block")
-
-          release_issue_claim(state, issue.id)
-        else
-          refresh_blocked_issue_state(state, issue)
-        end
-
-      true ->
-        Logger.info("Blocked issue moved to non-active state: #{issue_context(issue)} state=#{issue.state}; releasing block")
+      idle_block_released?(Map.get(state.blocked, issue.id), issue) ->
+        Logger.info("Blocked issue saw tracker progress: #{issue_context(issue)} updated_at=#{inspect(issue.updated_at)}; releasing block")
 
         release_issue_claim(state, issue.id)
+
+      true ->
+        refresh_blocked_issue_state(state, issue)
     end
   end
 
-  defp reconcile_blocked_issue_state(_issue, state, _active_states, _terminal_states), do: state
+  defp reconcile_blocked_issue_state(_issue, state, _terminal_states), do: state
+
+  # A finished ticket keeps no start on record: if it is ever reopened it should
+  # wait for a fresh decision instead of resuming on its own.
+  defp forget_dispatch_gate(issue_id) do
+    _ = DispatchGate.forget(issue_id)
+    :ok
+  end
 
   defp reconcile_missing_running_issue_ids(%State{} = state, requested_issue_ids, issues)
        when is_list(requested_issue_ids) and is_list(issues) do
@@ -909,14 +928,14 @@ defmodule SymphonyElixir.Orchestrator do
     :ok
   end
 
-  defp stop_and_block_issue(%State{} = state, issue_id, running_entry, error) do
+  defp stop_and_block_issue(%State{} = state, issue_id, running_entry, error, reason \\ :input_required) do
     stop_running_task(
       Map.get(running_entry, :pid),
       Map.get(running_entry, :ref),
       state.task_supervisor
     )
 
-    block_issue_from_entry(state, issue_id, running_entry, error)
+    block_issue_from_entry(state, issue_id, running_entry, error, reason)
   end
 
   defp block_issue_from_entry(%State{} = state, issue_id, running_entry, error, reason \\ :input_required) do
@@ -948,15 +967,171 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
+  # A pause has to survive a restart, so the block that expresses it is rebuilt
+  # from the store on every poll rather than only when a run ends. Items already
+  # parked are left alone: re-parking them each poll would reset their blocked
+  # entry and repeat the log line every cycle.
+  defp park_paused_issues(%State{} = state, issues) when is_list(issues) do
+    gate_statuses = DispatchGate.statuses()
+
+    if map_size(gate_statuses) == 0 do
+      state
+    else
+      Enum.reduce(issues, state, &maybe_park_paused_issue(&2, &1, gate_statuses))
+    end
+  end
+
+  defp maybe_park_paused_issue(%State{} = state, %Issue{id: issue_id}, gate_statuses)
+       when is_binary(issue_id) do
+    if Map.get(gate_statuses, issue_id) == :paused and
+         not paused_block?(Map.get(state.blocked, issue_id)) do
+      park_paused_issue(state, issue_id)
+    else
+      state
+    end
+  end
+
+  defp maybe_park_paused_issue(state, _issue, _gate_statuses), do: state
+
+  # Every route into a pause — parked mid-run, parked at the next poll after a
+  # restart, parked while the item waited at another block — lands in the same
+  # entry shape, so the dashboard and the dispatch guards only have one state to
+  # reason about.
+  defp park_paused_issue(%State{} = state, issue_id, source \\ %{}) do
+    state =
+      case Map.get(state.running, issue_id) do
+        nil ->
+          block_paused_issue(state, issue_id, Map.merge(Map.get(state.blocked, issue_id, %{}), source))
+
+        running_entry ->
+          Logger.info("Stopping agent for paused issue: issue_id=#{issue_id} issue_identifier=#{Map.get(running_entry, :identifier)} session_id=#{running_entry_session_id(running_entry)}")
+
+          state
+          |> record_session_completion_totals(running_entry)
+          |> stop_and_block_issue(issue_id, running_entry, @paused_error, :operator_paused)
+      end
+
+    stamp_pause_time(state, issue_id)
+  end
+
+  defp block_paused_issue(%State{} = state, issue_id, source) do
+    source = Map.merge(source, paused_issue_context(state, issue_id))
+
+    Logger.info("Parking paused issue: issue_id=#{issue_id} issue_identifier=#{Map.get(source, :identifier)}")
+
+    block_issue_from_entry(state, issue_id, source, @paused_error, :operator_paused)
+  end
+
+  # The blocked entry carries the tracker item so the dashboard can link it, and
+  # a pause recorded from the dashboard may be the first time this orchestrator
+  # has seen the item at all.
+  defp paused_issue_context(%State{} = state, issue_id) do
+    case known_issue(state, issue_id) do
+      %Issue{} = issue -> %{identifier: issue.identifier, issue: issue}
+      nil -> %{}
+    end
+  end
+
+  defp known_issue(%State{} = state, issue_id) do
+    entry_issue(Map.get(state.running, issue_id)) || entry_issue(Map.get(state.blocked, issue_id)) ||
+      Enum.find(state.tracker_issues, &match?(%Issue{id: ^issue_id}, &1))
+  end
+
+  defp entry_issue(%{issue: %Issue{} = issue}), do: issue
+  defp entry_issue(_entry), do: nil
+
+  # `blocked_at` would otherwise read as the moment the block was rebuilt, which
+  # after a restart says nothing. The operator wants to know when they paused it.
+  defp stamp_pause_time(%State{} = state, issue_id) do
+    with %{updated_at: paused_at} when is_binary(paused_at) <- DispatchGate.fetch(issue_id),
+         {:ok, paused_at, _offset} <- DateTime.from_iso8601(paused_at),
+         %{} = blocked_entry <- Map.get(state.blocked, issue_id) do
+      %{state | blocked: Map.put(state.blocked, issue_id, %{blocked_entry | blocked_at: paused_at})}
+    else
+      _ -> state
+    end
+  end
+
+  defp paused_block?(blocked_entry) when is_map(blocked_entry),
+    do: Map.get(blocked_entry, :block_reason) == :operator_paused
+
+  defp paused_block?(_blocked_entry), do: false
+
+  # Starting a ticket should be visible to everyone looking at the board, not just
+  # to whoever pressed the button, so the tracker item moves into the configured
+  # start state as part of the click. It is reported back rather than enforced: the
+  # local gate already authorized the run, and a tracker that refuses the write is
+  # a board-accuracy problem, not a reason to withhold the work.
+  defp move_started_issue_to_start_state(%State{} = state, issue_id) do
+    with {:ok, state_name} <- configured_start_state(),
+         %Issue{} = issue <- known_issue(state, issue_id) do
+      if normalize_issue_state(issue.state) == normalize_issue_state(state_name) do
+        {state, {:ok, issue.state}}
+      else
+        write_issue_state(state, issue, state_name)
+      end
+    else
+      nil -> {state, {:error, :issue_not_found}}
+      {:error, reason} -> {state, {:error, reason}}
+    end
+  end
+
+  defp write_issue_state(%State{} = state, %Issue{} = issue, state_name) do
+    case Tracker.update_issue_state(issue, state_name) do
+      {:ok, %Issue{} = updated_issue} ->
+        Logger.info("Moved tracker item to its start state: #{issue_context(issue)} state=#{updated_issue.state}")
+
+        {refresh_tracker_issue(state, updated_issue), {:ok, updated_issue.state}}
+
+      {:error, reason} ->
+        Logger.warning("Failed to move tracker item to its start state: #{issue_context(issue)} state=#{state_name} reason=#{inspect(reason)}")
+
+        {state, {:error, reason}}
+    end
+  end
+
+  # The first configured active state is the one Symphony puts work into when it
+  # starts; the rest of the list stays a plain intake fallback.
+  defp configured_start_state do
+    Config.settings!().tracker.active_states
+    |> List.wrap()
+    |> Enum.map(&(&1 |> to_string() |> String.trim()))
+    |> Enum.find(&(&1 != ""))
+    |> case do
+      nil -> {:error, :missing_start_state}
+      state_name -> {:ok, state_name}
+    end
+  end
+
+  defp refresh_tracker_issue(%State{} = state, %Issue{id: issue_id} = issue) do
+    tracker_issues =
+      Enum.map(state.tracker_issues, fn
+        %Issue{id: ^issue_id} -> issue
+        other -> other
+      end)
+
+    %{state | tracker_issues: tracker_issues}
+  end
+
+  defp poll_now_coalesced?(%State{} = state) do
+    now_ms = System.monotonic_time(:millisecond)
+
+    state.poll_check_in_progress == true or
+      (is_integer(state.next_poll_due_at_ms) and state.next_poll_due_at_ms <= now_ms)
+  end
+
+  defp request_poll_now(%State{} = state) do
+    if poll_now_coalesced?(state), do: state, else: schedule_tick(state, 0)
+  end
+
   defp choose_issues(issues, state) do
-    active_states = active_state_set()
     terminal_states = terminal_state_set()
 
     issues
     |> Workspace.dispatch_candidates()
     |> sort_issues_for_dispatch()
     |> Enum.reduce(state, fn issue, state_acc ->
-      if should_dispatch_issue?(issue, state_acc, active_states, terminal_states) do
+      if should_dispatch_issue?(issue, state_acc, terminal_states) do
         dispatch_issue(state_acc, issue)
       else
         state_acc
@@ -987,10 +1162,13 @@ defmodule SymphonyElixir.Orchestrator do
   defp should_dispatch_issue?(
          %Issue{} = issue,
          %State{running: running, claimed: claimed, blocked: blocked} = state,
-         active_states,
          terminal_states
        ) do
-    candidate_issue?(issue, active_states, terminal_states) and
+    # Intake is wide, dispatch is not: tracker state got the item onto the
+    # board, and only the operator's start takes it off the board and into a
+    # Codex run.
+    candidate_issue?(issue, terminal_states) and
+      DispatchGate.started?(issue.id) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
       !Map.has_key?(blocked, issue.id) and
@@ -999,7 +1177,7 @@ defmodule SymphonyElixir.Orchestrator do
       worker_slots_available?(state)
   end
 
-  defp should_dispatch_issue?(_issue, _state, _active_states, _terminal_states), do: false
+  defp should_dispatch_issue?(_issue, _state, _terminal_states), do: false
 
   defp state_slots_available?(%Issue{state: issue_state}, running) when is_map(running) do
     limit = Config.max_concurrent_agents_for_state(issue_state)
@@ -1028,17 +1206,15 @@ defmodule SymphonyElixir.Orchestrator do
            title: title,
            state: state_name
          } = issue,
-         active_states,
          terminal_states
        )
        when is_binary(id) and is_binary(identifier) and is_binary(title) and is_binary(state_name) do
     Enum.all?([id, identifier, title, state_name], &present_string?/1) and
       issue_routable?(issue) and
-      active_issue_state?(state_name, active_states) and
       !terminal_issue_state?(state_name, terminal_states)
   end
 
-  defp candidate_issue?(_issue, _active_states, _terminal_states), do: false
+  defp candidate_issue?(_issue, _terminal_states), do: false
 
   defp issue_routable?(%Issue{} = issue) do
     Issue.routable?(issue, Config.settings!().tracker.required_labels)
@@ -1053,23 +1229,12 @@ defmodule SymphonyElixir.Orchestrator do
   defp present_string?(value) when is_binary(value), do: String.trim(value) != ""
   defp present_string?(_value), do: false
 
-  defp active_issue_state?(state_name, active_states) when is_binary(state_name) do
-    MapSet.member?(active_states, normalize_issue_state(state_name))
-  end
-
   defp normalize_issue_state(state_name) when is_binary(state_name) do
     String.downcase(String.trim(state_name))
   end
 
   defp terminal_state_set do
     Config.settings!().tracker.terminal_states
-    |> Enum.map(&normalize_issue_state/1)
-    |> Enum.filter(&(&1 != ""))
-    |> MapSet.new()
-  end
-
-  defp active_state_set do
-    Config.settings!().tracker.active_states
     |> Enum.map(&normalize_issue_state/1)
     |> Enum.filter(&(&1 != ""))
     |> MapSet.new()
@@ -1299,6 +1464,13 @@ defmodule SymphonyElixir.Orchestrator do
 
         cleanup_issue_workspace(issue, metadata)
         {:noreply, release_issue_claim(state, issue_id)}
+
+      # The pause landed while this retry was already on the clock; park the item
+      # instead of starting the run the operator just called off.
+      DispatchGate.paused?(issue_id) ->
+        Logger.info("Retry cancelled for paused issue: #{issue_context(issue)}")
+
+        {:noreply, park_paused_issue(state, issue_id, metadata)}
 
       retry_candidate_issue?(issue, terminal_states) ->
         handle_active_retry(state, issue, attempt, metadata)
@@ -1632,6 +1804,68 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @doc """
+  Releases `issue_id` for dispatch and moves the tracker item into its start
+  state.
+
+  Intake only puts a ticket on the board; this is the click that authorizes token
+  spend on it. The tracker write is best effort and reported back in the reply —
+  the local gate is what actually admits the item to dispatch, so a tracker that
+  rejects the write leaves the run authorized rather than swallowing the start.
+  """
+  @spec start_issue(String.t(), keyword()) :: {:ok, map()} | {:error, term()} | :unavailable
+  def start_issue(issue_id, opts \\ []), do: start_issue(__MODULE__, issue_id, opts)
+
+  @spec start_issue(GenServer.server(), String.t(), keyword()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def start_issue(server, issue_id, opts) when is_binary(issue_id) do
+    if is_pid(server) or Process.whereis(server) do
+      GenServer.call(server, {:start_issue, issue_id, opts})
+    else
+      :unavailable
+    end
+  end
+
+  @doc """
+  Pauses `issue_id` locally: stops any run in flight and holds the item in a
+  block that only `resume_issue/3` clears.
+
+  This is the operator's answer to a ticket that is going nowhere. Unlike the
+  analysis gate, nothing about the item's own progress reopens it — tracker
+  activity, a retry timer, and a fresh poll all leave it parked.
+  """
+  @spec pause_issue(String.t(), keyword()) :: {:ok, map()} | {:error, term()} | :unavailable
+  def pause_issue(issue_id, opts \\ []), do: pause_issue(__MODULE__, issue_id, opts)
+
+  @spec pause_issue(GenServer.server(), String.t(), keyword()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def pause_issue(server, issue_id, opts) when is_binary(issue_id) do
+    if is_pid(server) or Process.whereis(server) do
+      GenServer.call(server, {:pause_issue, issue_id, opts})
+    else
+      :unavailable
+    end
+  end
+
+  @doc """
+  Clears the pause on `issue_id` so the next poll dispatches it again.
+
+  The item returns to `started`, not to the queue: it was authorized once already,
+  and asking for a second start would make a pause cost more than it should.
+  """
+  @spec resume_issue(String.t(), keyword()) :: {:ok, map()} | {:error, term()} | :unavailable
+  def resume_issue(issue_id, opts \\ []), do: resume_issue(__MODULE__, issue_id, opts)
+
+  @spec resume_issue(GenServer.server(), String.t(), keyword()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def resume_issue(server, issue_id, opts) when is_binary(issue_id) do
+    if is_pid(server) or Process.whereis(server) do
+      GenServer.call(server, {:resume_issue, issue_id, opts})
+    else
+      :unavailable
+    end
+  end
+
   @spec request_refresh() :: map() | :unavailable
   def request_refresh do
     request_refresh(__MODULE__)
@@ -1787,11 +2021,58 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  def handle_call({:start_issue, issue_id, opts}, _from, state) do
+    case DispatchGate.start(issue_id, opts) do
+      {:ok, record} ->
+        {state, tracker_state} = move_started_issue_to_start_state(state, issue_id)
+
+        Logger.info("Dispatch released by operator: issue_id=#{issue_id} issue_identifier=#{record.identifier} tracker_state=#{inspect(tracker_state)}")
+
+        # The operator is watching, so the run should begin now rather than at the
+        # end of the current poll interval.
+        state = request_poll_now(state)
+        notify_dashboard()
+
+        {:reply, {:ok, Map.put(record, :tracker_state, tracker_state)}, state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call({:pause_issue, issue_id, opts}, _from, state) do
+    case DispatchGate.pause(issue_id, opts) do
+      {:ok, record} ->
+        state = park_paused_issue(state, issue_id)
+        notify_dashboard()
+
+        {:reply, {:ok, record}, state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call({:resume_issue, issue_id, opts}, _from, state) do
+    case DispatchGate.resume(issue_id, opts) do
+      {:ok, record} ->
+        Logger.info("Released operator pause issue_id=#{issue_id}; the next poll dispatches it again")
+
+        # Dropping the claim, and with it the paused block, is what lets the next
+        # poll pick the item up.
+        state = state |> release_issue_claim(issue_id) |> request_poll_now()
+        notify_dashboard()
+
+        {:reply, {:ok, record}, state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
   def handle_call(:request_refresh, _from, state) do
-    now_ms = System.monotonic_time(:millisecond)
-    already_due? = is_integer(state.next_poll_due_at_ms) and state.next_poll_due_at_ms <= now_ms
-    coalesced = state.poll_check_in_progress == true or already_due?
-    state = if coalesced, do: state, else: schedule_tick(state, 0)
+    coalesced = poll_now_coalesced?(state)
+    state = request_poll_now(state)
 
     {:reply,
      %{
@@ -1992,7 +2273,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp retry_candidate_issue?(%Issue{} = issue, terminal_states) do
-    candidate_issue?(issue, active_state_set(), terminal_states)
+    candidate_issue?(issue, terminal_states)
   end
 
   defp dispatch_slots_available?(%Issue{} = issue, %State{} = state) do

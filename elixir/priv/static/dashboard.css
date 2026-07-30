@@ -413,6 +413,57 @@ pre,
   min-width: 15rem;
 }
 
+.start-button,
+.pause-button,
+.resume-button {
+  appearance: none;
+  border-radius: 999px;
+  padding: 0.34rem 0.86rem;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.82rem;
+  font-weight: 600;
+  white-space: nowrap;
+  justify-self: start;
+  transition:
+    background 140ms ease,
+    border-color 140ms ease;
+}
+
+.start-button {
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: white;
+}
+
+.start-button:hover {
+  background: var(--accent-ink);
+  border-color: var(--accent-ink);
+}
+
+.pause-button {
+  border: 1px solid var(--line-strong);
+  background: rgba(255, 255, 255, 0.72);
+  color: var(--muted);
+}
+
+.pause-button:hover {
+  background: white;
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.resume-button {
+  border: 1px solid var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+}
+
+.resume-button:hover {
+  background: var(--accent);
+  color: white;
+}
+
 .revision-form {
   display: grid;
   gap: 0.36rem;

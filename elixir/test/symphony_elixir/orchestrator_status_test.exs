@@ -900,6 +900,105 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert next_poll_in_ms <= 50
   end
 
+  test "intake takes every open ticket and a poll dispatches none of them" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    open_issue = %Issue{
+      id: "issue-intake-open",
+      identifier: "MT-OPEN",
+      title: "Not started yet",
+      state: "Open",
+      url: "https://example.org/issues/MT-OPEN",
+      dispatchable: true
+    }
+
+    active_issue = %Issue{open_issue | id: "issue-intake-active", identifier: "MT-ACTIVE", state: "In Progress"}
+    closed_issue = %Issue{open_issue | id: "issue-intake-closed", identifier: "MT-CLOSED", state: "Closed"}
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+      open_issue,
+      active_issue,
+      closed_issue
+    ])
+
+    orchestrator_name = Module.concat(__MODULE__, :IntakeOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    send(pid, :tick)
+    Process.sleep(100)
+    state = :sys.get_state(pid)
+
+    # The board is wide: an "Open" ticket is intake-eligible even though no agent
+    # may run in that state, and only the closed one is left out.
+    assert Enum.map(state.tracker_issues, & &1.identifier) == ["MT-OPEN", "MT-ACTIVE"]
+
+    # None of it runs. Both open tickets are dispatch-shaped — routable, titled,
+    # non-terminal — and both stay untouched because nobody pressed start.
+    assert state.running == %{}
+    assert state.claimed == MapSet.new()
+    assert state.blocked == %{}
+    refute Orchestrator.should_dispatch_issue_for_test(active_issue, state)
+  end
+
+  test "a fresh orchestrator re-parks a paused issue on its first poll" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    issue = %Issue{
+      id: "issue-paused-restart",
+      identifier: "MT-PAUSED",
+      title: "Paused across a restart",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-PAUSED",
+      dispatchable: true
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    # The pause is on record before this orchestrator exists: a restart must not
+    # quietly resume the work.
+    {:ok, record} = SymphonyElixir.DispatchGate.pause(issue.id, identifier: "MT-PAUSED")
+
+    orchestrator_name = Module.concat(__MODULE__, :PausedRestartOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    send(pid, :tick)
+    Process.sleep(100)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.running, issue.id)
+    assert MapSet.member?(state.claimed, issue.id)
+
+    assert %{
+             block_reason: :operator_paused,
+             identifier: "MT-PAUSED",
+             blocked_at: blocked_at
+           } = state.blocked[issue.id]
+
+    assert DateTime.to_iso8601(blocked_at) == record.updated_at
+
+    assert %{
+             blocked: [
+               %{
+                 identifier: "MT-PAUSED",
+                 issue_url: "https://example.org/issues/MT-PAUSED",
+                 block_reason: :operator_paused
+               }
+             ]
+           } = Orchestrator.snapshot(orchestrator_name, 1_000)
+  end
+
   test "orchestrator restarts stalled workers with retry backoff" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",

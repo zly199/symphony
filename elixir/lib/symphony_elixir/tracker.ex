@@ -22,6 +22,8 @@ defmodule SymphonyElixir.Tracker do
 
   @callback fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   @callback fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
+  @callback fetch_open_issues([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
+  @callback update_issue_state(Issue.t(), String.t()) :: {:ok, Issue.t()} | {:error, term()}
   @callback agent_tool_specs() :: [map()]
   @callback execute_agent_tool(String.t(), term(), keyword()) :: map()
   @callback secret_environment_names(map()) :: [String.t()]
@@ -29,11 +31,53 @@ defmodule SymphonyElixir.Tracker do
 
   @optional_callbacks agent_tool_specs: 0,
                       execute_agent_tool: 3,
+                      fetch_open_issues: 1,
+                      update_issue_state: 2,
                       validate_config: 1
 
   @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_states(states) do
     adapter().fetch_issues_by_states(states)
+  end
+
+  @doc """
+  Returns every issue eligible to enter Symphony.
+
+  Intake is intentionally wider than dispatch: an operator picks work off this
+  list, so it should hold everything the tracker has not finished with, not just
+  the states an agent may run in. Trackers that can express "not closed" natively
+  answer it directly; the rest fall back to the configured `active_states`,
+  because inventing a state list for an API this build cannot verify would drop
+  tickets silently.
+  """
+  @spec fetch_intake_issues() :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_intake_issues do
+    tracker = Config.settings!().tracker
+    adapter = adapter_for_settings!(tracker)
+
+    if supports?(adapter, :fetch_open_issues, 1) do
+      adapter.fetch_open_issues(tracker.terminal_states)
+    else
+      adapter.fetch_issues_by_states(tracker.active_states)
+    end
+  end
+
+  @doc """
+  Moves `issue` to `state_name` in the tracker.
+
+  Symphony writes tracker state in exactly one place — the operator pressing
+  start — so that the board reflects what is actually being worked on. Trackers
+  without a state-write adapter say so instead of failing quietly.
+  """
+  @spec update_issue_state(Issue.t(), String.t()) :: {:ok, Issue.t()} | {:error, term()}
+  def update_issue_state(%Issue{} = issue, state_name) when is_binary(state_name) do
+    adapter = adapter()
+
+    if supports?(adapter, :update_issue_state, 2) do
+      adapter.update_issue_state(issue, state_name)
+    else
+      {:error, {:unsupported_tracker_state_write, Config.settings!().tracker.kind}}
+    end
   end
 
   @spec fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
@@ -105,11 +149,15 @@ defmodule SymphonyElixir.Tracker do
   end
 
   defp adapter_agent_tool_specs(adapter) do
-    if Code.ensure_loaded?(adapter) and function_exported?(adapter, :agent_tool_specs, 0) do
+    if supports?(adapter, :agent_tool_specs, 0) do
       adapter.agent_tool_specs()
     else
       []
     end
+  end
+
+  defp supports?(adapter, function, arity) do
+    Code.ensure_loaded?(adapter) and function_exported?(adapter, function, arity)
   end
 
   defp execute_agent_tool_with_adapter(adapter, tool, arguments, opts) do

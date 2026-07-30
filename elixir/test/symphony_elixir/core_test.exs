@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.CoreTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.{AnalysisFeedback, ApprovalStore}
+  alias SymphonyElixir.{AnalysisFeedback, ApprovalStore, DispatchGate}
 
   test "config defaults and validation checks" do
     write_workflow_file!(Workflow.workflow_file_path(),
@@ -405,6 +405,10 @@ defmodule SymphonyElixir.CoreTest do
     )
 
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    # Nothing is dispatched until an operator releases the item, and the release
+    # has to outlive the orchestrator restart this test performs.
+    {:ok, _record} = DispatchGate.start(issue.id, identifier: issue.identifier)
 
     assert {:ok, runtime_supervisor_pid} =
              SymphonyElixir.AgentRuntimeSupervisor.start_link(
@@ -1326,6 +1330,358 @@ defmodule SymphonyElixir.CoreTest do
 
     :ok = AnalysisFeedback.clear(issue_id)
     assert AnalysisFeedback.notes(issue_id) == []
+  end
+
+  test "starting an issue releases dispatch and moves the tracker item into progress" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["In Progress"],
+      tracker_terminal_states: ["Closed"]
+    )
+
+    issue_id = "issue-start-gate"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-994",
+      title: "Waiting for a decision",
+      state: "Open",
+      url: "https://example.org/issues/MT-994",
+      dispatchable: true
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    orchestrator_name = Module.concat(__MODULE__, :StartGateOrchestrator)
+    {:ok, pid} = start_continuation_orchestrator(orchestrator_name)
+
+    :sys.replace_state(pid, fn state -> Map.put(state, :tracker_issues, [issue]) end)
+
+    state = :sys.get_state(pid)
+    assert DispatchGate.status(issue_id) == :waiting
+    refute Orchestrator.should_dispatch_issue_for_test(issue, state)
+
+    assert {:ok, record} =
+             Orchestrator.start_issue(pid, issue_id, identifier: "MT-994", updated_by: "tester")
+
+    assert record.status == :started
+    assert record.updated_by == "tester"
+
+    # The board should say what is actually being worked on, so the click moves the
+    # tracker item into the first configured active state.
+    assert record.tracker_state == {:ok, "In Progress"}
+    assert {:ok, [%Issue{state: "In Progress"}]} = Tracker.fetch_issues_by_ids([issue_id])
+
+    state = :sys.get_state(pid)
+    assert [%Issue{state: "In Progress"}] = state.tracker_issues
+    assert Orchestrator.should_dispatch_issue_for_test(%Issue{issue | state: "In Progress"}, state)
+  end
+
+  test "starting an issue keeps the release when the tracker write fails" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_active_states: ["In Progress"])
+
+    issue_id = "issue-start-unknown"
+    orchestrator_name = Module.concat(__MODULE__, :StartGateUnknownOrchestrator)
+    {:ok, pid} = start_continuation_orchestrator(orchestrator_name)
+
+    assert {:ok, record} = Orchestrator.start_issue(pid, issue_id, identifier: "MT-995")
+
+    # Nothing about a tracker that cannot be updated should silently swallow the
+    # operator's decision to run the work.
+    assert record.tracker_state == {:error, :issue_not_found}
+    assert DispatchGate.started?(issue_id)
+  end
+
+  test "a terminal tracker state forgets the operator's start" do
+    issue_id = "issue-start-terminal"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_terminal_states: ["Closed"],
+      tracker_active_states: ["In Progress"]
+    )
+
+    agent_pid = spawn(fn -> Process.sleep(:infinity) end)
+
+    state = %Orchestrator.State{
+      running: %{
+        issue_id => %{
+          pid: agent_pid,
+          ref: nil,
+          identifier: "MT-996",
+          issue: %Issue{id: issue_id, identifier: "MT-996", state: "In Progress", dispatchable: true},
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    {:ok, _record} = DispatchGate.start(issue_id, identifier: "MT-996")
+
+    closed_issue = %Issue{
+      id: issue_id,
+      identifier: "MT-996",
+      title: "Finished work",
+      state: "Closed",
+      dispatchable: true
+    }
+
+    updated_state = Orchestrator.reconcile_issue_states_for_test([closed_issue], state)
+
+    refute Map.has_key?(updated_state.running, issue_id)
+    refute Process.alive?(agent_pid)
+
+    # Reopening a closed ticket must ask for a fresh decision instead of resuming
+    # on a start that is months old.
+    assert DispatchGate.status(issue_id) == :waiting
+  end
+
+  test "an open tracker state does not stop a run the operator started" do
+    issue_id = "issue-open-column"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_terminal_states: ["Closed"],
+      tracker_active_states: ["In Progress"]
+    )
+
+    agent_pid = spawn(fn -> Process.sleep(:infinity) end)
+
+    state = %Orchestrator.State{
+      running: %{
+        issue_id => %{
+          pid: agent_pid,
+          ref: nil,
+          identifier: "MT-997",
+          issue: %Issue{id: issue_id, identifier: "MT-997", state: "In Progress", dispatchable: true},
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    moved_issue = %Issue{
+      id: issue_id,
+      identifier: "MT-997",
+      title: "Moved between open columns",
+      state: "Pending",
+      dispatchable: true
+    }
+
+    updated_state = Orchestrator.reconcile_issue_states_for_test([moved_issue], state)
+
+    assert updated_state.running[issue_id].issue.state == "Pending"
+    assert Process.alive?(agent_pid)
+
+    Process.exit(agent_pid, :kill)
+  end
+
+  test "pausing a running issue stops the agent and parks it until it is resumed" do
+    issue_id = "issue-pause-running"
+    orchestrator_name = Module.concat(__MODULE__, :PauseRunningOrchestrator)
+    {:ok, pid} = start_continuation_orchestrator(orchestrator_name)
+
+    worker_pid = spawn(fn -> Process.sleep(:infinity) end)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-990",
+      title: "Pause a running issue",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-990",
+      dispatchable: true,
+      updated_at: ~U[2026-07-29 09:00:00Z]
+    }
+
+    running_entry = %{
+      pid: worker_pid,
+      ref: Process.monitor(worker_pid),
+      identifier: "MT-990",
+      issue: issue,
+      session_id: "thread-pause-turn-pause",
+      workspace_path: "/workspaces/MT-990",
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn state ->
+      state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(state.claimed, issue_id))
+    end)
+
+    assert {:ok, record} =
+             Orchestrator.pause_issue(pid, issue_id, identifier: "MT-990", updated_by: "tester")
+
+    assert record.identifier == "MT-990"
+    assert record.updated_by == "tester"
+    assert DispatchGate.paused?(issue_id)
+
+    refute Process.alive?(worker_pid)
+
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.running, issue_id)
+    assert MapSet.member?(state.claimed, issue_id)
+
+    assert %{
+             block_reason: :operator_paused,
+             error: "paused by the operator" <> _,
+             identifier: "MT-990",
+             workspace_path: "/workspaces/MT-990",
+             blocked_at: blocked_at
+           } = state.blocked[issue_id]
+
+    # The block reads as paused when the operator paused it, not when the entry
+    # was last rebuilt.
+    assert DateTime.to_iso8601(blocked_at) == record.updated_at
+
+    # Nothing about the item's own progress reopens it.
+    refute Orchestrator.should_dispatch_issue_for_test(issue, state)
+
+    moved_issue = %{issue | updated_at: ~U[2026-07-30 05:00:00Z]}
+    reconciled = Orchestrator.reconcile_blocked_issue_states_for_test([moved_issue], state)
+
+    assert %{block_reason: :operator_paused} = reconciled.blocked[issue_id]
+
+    assert {:ok, resumed} = Orchestrator.resume_issue(pid, issue_id, [])
+    assert resumed.status == :started
+    refute DispatchGate.paused?(issue_id)
+
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.blocked, issue_id)
+    refute MapSet.member?(state.claimed, issue_id)
+
+    # Resuming returns the item to the work it was already authorized for, so it is
+    # dispatchable again without a second start.
+    assert Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
+  test "a paused issue parks instead of retrying after an abnormal exit" do
+    issue_id = "issue-pause-crash"
+    orchestrator_name = Module.concat(__MODULE__, :PauseCrashOrchestrator)
+    {:ok, pid} = start_continuation_orchestrator(orchestrator_name)
+    ref = make_ref()
+
+    issue = %Issue{id: issue_id, identifier: "MT-991", state: "In Progress"}
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-991",
+      issue: issue,
+      started_at: DateTime.utc_now()
+    }
+
+    {:ok, _record} = DispatchGate.pause(issue_id, identifier: "MT-991")
+
+    :sys.replace_state(pid, fn state ->
+      state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(state.claimed, issue_id))
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :boom})
+    Process.sleep(50)
+
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    assert %{block_reason: :operator_paused} = state.blocked[issue_id]
+  end
+
+  test "a retry that comes due for a paused issue parks it instead of dispatching" do
+    issue_id = "issue-pause-retry"
+    orchestrator_name = Module.concat(__MODULE__, :PauseRetryOrchestrator)
+    {:ok, pid} = start_continuation_orchestrator(orchestrator_name)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-992",
+      title: "Paused retry",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-992"
+    }
+
+    {:ok, _record} = DispatchGate.pause(issue_id, identifier: "MT-992")
+
+    state =
+      Orchestrator.handle_retry_issue_lookup_for_test(issue, :sys.get_state(pid), issue_id, 2, %{
+        identifier: "MT-992",
+        worker_host: "dm-dev2",
+        workspace_path: "/workspaces/MT-992"
+      })
+
+    assert %{
+             block_reason: :operator_paused,
+             worker_host: "dm-dev2",
+             workspace_path: "/workspaces/MT-992"
+           } = state.blocked[issue_id]
+
+    refute Map.has_key?(state.retry_attempts, issue_id)
+  end
+
+  test "the dispatch gate defaults to waiting and records every operator decision" do
+    issue_id = "issue-gate-store"
+
+    # An item Symphony has never been told to run must never read as runnable.
+    assert DispatchGate.status(issue_id) == :waiting
+    assert DispatchGate.status(nil) == :waiting
+    refute DispatchGate.started?(issue_id)
+    refute DispatchGate.paused?(issue_id)
+    assert DispatchGate.fetch(issue_id) == nil
+    assert DispatchGate.fetch(nil) == nil
+    assert DispatchGate.statuses() == %{}
+    assert DispatchGate.path() =~ "dispatch_gate.json"
+
+    assert {:ok, record} = DispatchGate.start(issue_id, identifier: "MT-993")
+    assert record.issue_id == issue_id
+    assert record.status == :started
+    assert record.updated_by == "dashboard"
+    assert is_binary(record.updated_at)
+
+    assert DispatchGate.started?(issue_id)
+    assert DispatchGate.fetch(issue_id) == record
+    assert DispatchGate.statuses() == %{issue_id => :started}
+
+    assert {:ok, paused} = DispatchGate.pause(issue_id, identifier: "MT-993", updated_by: "tester")
+    assert paused.status == :paused
+    assert paused.updated_by == "tester"
+    assert DispatchGate.statuses() == %{issue_id => :paused}
+    refute DispatchGate.started?(issue_id)
+
+    assert {:ok, resumed} = DispatchGate.resume(issue_id)
+    assert resumed.status == :started
+
+    assert :ok = DispatchGate.forget(issue_id)
+    assert DispatchGate.status(issue_id) == :waiting
+    assert DispatchGate.statuses() == %{}
+
+    # Forgetting an unknown item is a no-op rather than a write.
+    assert :ok = DispatchGate.forget(issue_id)
+  end
+
+  test "an unreadable gate record reads as waiting instead of authorizing a run" do
+    File.mkdir_p!(Path.dirname(DispatchGate.path()))
+    File.write!(DispatchGate.path(), Jason.encode!(%{"issue-gate-corrupt" => %{"status" => "sprinting"}}))
+
+    assert DispatchGate.status("issue-gate-corrupt") == :waiting
+    assert DispatchGate.statuses() == %{}
+  end
+
+  test "an unwritable state dir surfaces the gate failure instead of claiming success" do
+    blocker = Path.join(System.tmp_dir!(), "symphony-gate-blocker-#{System.unique_integer([:positive])}")
+    File.write!(blocker, "not a directory")
+    on_exit(fn -> File.rm_rf(blocker) end)
+
+    Application.put_env(:symphony_elixir, :state_dir, Path.join(blocker, "var"))
+
+    assert capture_log(fn ->
+             assert {:error, :enotdir} = DispatchGate.start("issue-gate-unwritable")
+             assert {:error, :enotdir} = DispatchGate.pause("issue-gate-unwritable")
+           end) =~ "Failed to persist state file"
   end
 
   test "tracker progress does not release an approval block" do

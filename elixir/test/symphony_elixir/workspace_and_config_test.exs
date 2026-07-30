@@ -3,8 +3,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   alias Ecto.Changeset
   alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.Config.Schema.{Codex, StringOrMap}
+  alias SymphonyElixir.{DispatchGate, PromptBuilder, ResumeState}
   alias SymphonyElixir.Linear.Client
-  alias SymphonyElixir.{PromptBuilder, ResumeState}
   alias SymphonyElixir.Tracker.Issue
 
   test "workspace bootstrap can be implemented in after_create hook" do
@@ -1066,6 +1066,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       dispatchable: true
     }
 
+    {:ok, _record} = DispatchGate.start(issue.id)
+
     refute Orchestrator.should_dispatch_issue_for_test(issue, state)
 
     assert Orchestrator.should_dispatch_issue_for_test(
@@ -1091,6 +1093,12 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       blocked_by: [%{id: "blocker-2", identifier: "MT-1004", state: "Closed"}],
       dispatchable: true
     }
+
+    # Intake eligibility is not enough on its own now; the operator's start is what
+    # makes an item dispatchable.
+    refute Orchestrator.should_dispatch_issue_for_test(issue, state)
+
+    {:ok, _record} = DispatchGate.start(issue.id)
 
     assert Orchestrator.should_dispatch_issue_for_test(issue, state)
   end

@@ -24,6 +24,13 @@ defmodule SymphonyElixir.Backlog.Adapter do
   @spec fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_ids(ids), do: client_module().fetch_issues_by_ids(ids)
 
+  @spec fetch_open_issues([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_open_issues(terminal_states), do: client_module().fetch_open_issues(terminal_states)
+
+  @spec update_issue_state(Issue.t(), String.t()) :: {:ok, Issue.t()} | {:error, term()}
+  def update_issue_state(%Issue{} = issue, state_name),
+    do: client_module().update_issue_state(issue, state_name)
+
   @spec agent_tool_specs() :: [map()]
   def agent_tool_specs, do: AgentTool.tool_specs()
 

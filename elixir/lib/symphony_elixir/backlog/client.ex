@@ -33,6 +33,16 @@ defmodule SymphonyElixir.Backlog.Client do
     fetch_issues_by_ids(ids, Config.settings!().tracker, &perform_request/5)
   end
 
+  @spec fetch_open_issues([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_open_issues(terminal_states) when is_list(terminal_states) do
+    fetch_open_issues(terminal_states, Config.settings!().tracker, &perform_request/5)
+  end
+
+  @spec update_issue_state(Issue.t(), String.t()) :: {:ok, Issue.t()} | {:error, term()}
+  def update_issue_state(%Issue{} = issue, state_name) when is_binary(state_name) do
+    update_issue_state(issue, state_name, Config.settings!().tracker, &perform_request/5)
+  end
+
   @spec request(String.t(), String.t(), map(), term(), keyword()) ::
           {:ok, %{status: integer(), body: term()}} | {:error, term()}
   def request(method, path, query, form, opts \\ [])
@@ -71,6 +81,22 @@ defmodule SymphonyElixir.Backlog.Client do
     fetch_issues_by_ids(ids, tracker_settings, request_fun)
   end
 
+  @doc false
+  @spec fetch_open_issues_for_test([String.t()], map(), function()) ::
+          {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_open_issues_for_test(terminal_states, tracker_settings, request_fun)
+      when is_list(terminal_states) and is_map(tracker_settings) and is_function(request_fun, 5) do
+    fetch_open_issues(terminal_states, tracker_settings, request_fun)
+  end
+
+  @doc false
+  @spec update_issue_state_for_test(Issue.t(), String.t(), map(), function()) ::
+          {:ok, Issue.t()} | {:error, term()}
+  def update_issue_state_for_test(%Issue{} = issue, state_name, tracker_settings, request_fun)
+      when is_binary(state_name) and is_map(tracker_settings) and is_function(request_fun, 5) do
+    update_issue_state(issue, state_name, tracker_settings, request_fun)
+  end
+
   defp fetch_issues_by_states([], _tracker_settings, _request_fun), do: {:ok, []}
 
   defp fetch_issues_by_states(states, tracker_settings, request_fun) do
@@ -80,22 +106,111 @@ defmodule SymphonyElixir.Backlog.Client do
          {:ok, project} <- fetch_project(backlog_settings, request_fun),
          {:ok, statuses} <- fetch_statuses(backlog_settings, request_fun),
          {:ok, status_ids} <- matching_status_ids(statuses, requested_states) do
-      case status_ids do
-        [] ->
-          {:ok, []}
+      fetch_pages_for_status_ids(
+        backlog_settings,
+        project,
+        status_ids,
+        requested_states,
+        request_fun
+      )
+    end
+  end
 
-        ids ->
-          fetch_issue_pages(
-            backlog_settings,
-            project["id"],
-            ids,
-            requested_states,
-            0,
-            request_fun,
-            []
-          )
+  # Backlog names its statuses per project, so "everything still open" is only
+  # knowable from the project's own status list. Asking for it here keeps the
+  # orchestrator out of the business of enumerating a board it cannot see.
+  defp fetch_open_issues(terminal_states, tracker_settings, request_fun) do
+    excluded = terminal_states |> Enum.map(&normalize_state/1) |> MapSet.new()
+
+    with {:ok, backlog_settings} <- settings(tracker_settings),
+         {:ok, project} <- fetch_project(backlog_settings, request_fun),
+         {:ok, statuses} <- fetch_statuses(backlog_settings, request_fun),
+         {:ok, open_states} <- open_status_names(statuses, excluded) do
+      requested_states = MapSet.new(open_states, &normalize_state/1)
+
+      with {:ok, status_ids} <- matching_status_ids(statuses, requested_states) do
+        fetch_pages_for_status_ids(
+          backlog_settings,
+          project,
+          status_ids,
+          requested_states,
+          request_fun
+        )
       end
     end
+  end
+
+  defp update_issue_state(%Issue{} = issue, state_name, tracker_settings, request_fun) do
+    with {:ok, backlog_settings} <- settings(tracker_settings),
+         {:ok, statuses} <- fetch_statuses(backlog_settings, request_fun),
+         {:ok, status_id} <- status_id_for_name(statuses, state_name),
+         {:ok, payload} <-
+           request_with_settings(
+             "PATCH",
+             "/issues/#{encoded(issue.identifier)}",
+             %{},
+             %{"statusId" => status_id},
+             backlog_settings,
+             request_fun,
+             false
+           ) do
+      updated_issue(payload, backlog_settings, issue)
+    end
+  end
+
+  defp updated_issue(payload, settings, issue) when is_map(payload) do
+    case normalize_issue(payload, settings) do
+      %Issue{} = updated -> {:ok, updated}
+      nil -> {:ok, issue}
+    end
+  end
+
+  defp updated_issue(_payload, _settings, issue), do: {:ok, issue}
+
+  defp fetch_pages_for_status_ids(_settings, _project, [], _requested_states, _request_fun) do
+    {:ok, []}
+  end
+
+  defp fetch_pages_for_status_ids(settings, project, status_ids, requested_states, request_fun) do
+    fetch_issue_pages(
+      settings,
+      project["id"],
+      status_ids,
+      requested_states,
+      0,
+      request_fun,
+      []
+    )
+  end
+
+  defp open_status_names(statuses, excluded) do
+    Enum.reduce_while(statuses, {:ok, []}, fn
+      %{"name" => name}, {:ok, names} when is_binary(name) ->
+        if MapSet.member?(excluded, normalize_state(name)) do
+          {:cont, {:ok, names}}
+        else
+          {:cont, {:ok, [name | names]}}
+        end
+
+      _status, _acc ->
+        {:halt, {:error, :backlog_unknown_payload}}
+    end)
+    |> case do
+      {:ok, names} -> {:ok, Enum.reverse(names)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp status_id_for_name(statuses, state_name) do
+    normalized = normalize_state(state_name)
+
+    Enum.find_value(statuses, {:error, {:backlog_unknown_status, state_name}}, fn
+      %{"id" => id, "name" => name} when is_integer(id) and is_binary(name) ->
+        if normalize_state(name) == normalized, do: {:ok, id}
+
+      _status ->
+        nil
+    end)
   end
 
   defp fetch_project(settings, request_fun) do

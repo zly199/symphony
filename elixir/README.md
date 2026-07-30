@@ -13,13 +13,14 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 
 ## How it works
 
-1. Polls the configured tracker for candidate work (included adapters: Linear, GitHub Issues, Jira
+1. Polls the configured tracker for open work (included adapters: Linear, GitHub Issues, Jira
    Cloud, Asana, and GitLab)
-2. Creates a workspace per issue
-3. Launches Codex in [App Server mode](https://developers.openai.com/codex/app-server/) inside the
+2. Lists it on the dashboard as `waiting`, where an operator starts the ones worth running
+3. Creates a workspace per started issue
+4. Launches Codex in [App Server mode](https://developers.openai.com/codex/app-server/) inside the
    workspace
-4. Sends a workflow prompt to Codex
-5. Keeps Codex working on the issue until the work is done
+5. Sends a workflow prompt to Codex
+6. Keeps Codex working on the issue until the work is done
 
 During app-server sessions, the selected tracker adapter may advertise provider-native tools.
 Linear serves `linear_graphql`, Backlog serves `backlog_api`, GitHub Issues serves `github_api`,
@@ -28,12 +29,42 @@ executes those tools with configured host-side auth and removes declared tracker
 variables from the Codex child, so the agent does not need a second tracker login.
 
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
-Symphony stops the active agent for that issue and cleans up matching workspaces.
+Symphony stops the active agent for that issue, cleans up matching workspaces, and clears the issue's
+dispatch gate record.
 
 If Codex reports that operator input, approval, or MCP elicitation is required, Symphony keeps the
 issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. Blocked
 entries are in memory only; restarting the orchestrator clears that blocked map, so any still-active
 tracker issue can become a dispatch candidate again after restart.
+
+### Intake, dispatch, and the operator gate
+
+Intake and dispatch are separate decisions. Intake is every issue the tracker has not finished with —
+anything outside `terminal_states` — so the dashboard shows the whole open board, not just the states
+an agent may run in. Dispatch waits for the operator: each issue carries a gate status in
+`dispatch_gate.json` in the state dir, and only `started` issues are dispatched.
+
+- `waiting` (default, including issues Symphony has never seen): listed, never dispatched, no tokens
+  spent.
+- `started`: the dashboard's start action recorded a release. It also moves the tracker issue into the
+  first entry of `active_states`, so the board reflects what is being worked on. That write is best
+  effort and reported back to the operator; a tracker that refuses it leaves the run authorized.
+- `paused`: the run in flight is stopped and the issue is held in a blocked entry with reason
+  `operator_paused`. Tracker updates, retry timers, and restarts all leave it parked. Resuming returns
+  it to `started` — not to `waiting` — because the work was already authorized.
+
+Reaching a terminal state deletes the gate record, so a reopened issue waits for a fresh decision.
+
+Because the operator's start and pause are the run signals, moving an issue between open tracker
+states no longer stops an active run; only a terminal state, a routing change (assignee or required
+labels), or a pause does.
+
+Trackers that can express "not closed" natively answer intake directly (Backlog derives it from the
+project's own status list; GitHub and GitLab are already scoped to open issues). Other adapters fall
+back to reading the configured `active_states`, so on Linear, Jira, and Asana intake stays as narrow
+as that list until their adapters gain a native open-issue read. `active_states` keeps two jobs
+everywhere: its first entry is the state a started issue is moved into, and the whole list is the
+intake fallback.
 
 ## How to use it
 
@@ -276,6 +307,10 @@ codex:
   configured state names to Backlog status IDs, then page `/issues` in batches of 100. State
   matching ignores case and surrounding whitespace. ID refreshes use Backlog's immutable numeric
   issue ID, omit `404` records, and reject issues outside the configured project.
+- Intake and state writes: the adapter answers intake natively by taking every project status that is
+  not in `terminal_states`, so a new Backlog status enters Symphony without a config change. Starting
+  an issue `PATCH`es `/issues/{issueKey}` with the status ID matching the first `active_states` entry;
+  an unknown name fails with `{:backlog_unknown_status, name}`.
 - Identity and normalization: `issue.id` is the numeric Backlog issue ID as a string and
   `issue.identifier` is the native issue key such as `PROJECT-123`. Category names become
   normalized Symphony labels, Backlog priority IDs remain integer priorities, and malformed

@@ -16,6 +16,16 @@ defmodule SymphonyElixir.Backlog.AdapterTest do
       send(self(), {:backlog_ids_called, ids})
       {:ok, ids}
     end
+
+    def fetch_open_issues(terminal_states) do
+      send(self(), {:backlog_open_called, terminal_states})
+      {:ok, terminal_states}
+    end
+
+    def update_issue_state(issue, state_name) do
+      send(self(), {:backlog_state_write_called, issue.identifier, state_name})
+      {:ok, %{issue | state: state_name}}
+    end
   end
 
   setup do
@@ -57,6 +67,17 @@ defmodule SymphonyElixir.Backlog.AdapterTest do
 
     assert {:ok, ["42"]} = BacklogAdapter.fetch_issues_by_ids(["42"])
     assert_receive {:backlog_ids_called, ["42"]}
+
+    assert {:ok, ["Closed"]} = BacklogAdapter.fetch_open_issues(["Closed"])
+    assert_receive {:backlog_open_called, ["Closed"]}
+
+    assert {:ok, %{state: "In Progress"}} =
+             BacklogAdapter.update_issue_state(
+               %SymphonyElixir.Tracker.Issue{id: "42", identifier: "TEST-42", state: "Open"},
+               "In Progress"
+             )
+
+    assert_receive {:backlog_state_write_called, "TEST-42", "In Progress"}
 
     assert [%{"name" => "backlog_api"}] = BacklogAdapter.agent_tool_specs()
 
@@ -211,6 +232,83 @@ defmodule SymphonyElixir.Backlog.AdapterTest do
                     }, %{api_key: "test-token"}}
 
     assert_receive {:backlog_page, %{"offset" => 100}, %{project_key: "TEST"}}
+  end
+
+  test "client reads every non-terminal Backlog status for intake" do
+    request_fun = fn
+      "GET", "/projects/TEST", %{}, nil, _settings ->
+        {:ok, %{status: 200, body: %{"id" => 7, "projectKey" => "TEST"}}}
+
+      "GET", "/projects/TEST/statuses", %{}, nil, _settings ->
+        {:ok,
+         %{
+           status: 200,
+           body: [
+             %{"id" => 1, "name" => "Open"},
+             %{"id" => 2, "name" => "In Progress"},
+             %{"id" => 3, "name" => "Resolved"},
+             %{"id" => 4, "name" => "Closed"}
+           ]
+         }}
+
+      "GET", "/issues", query, nil, _settings ->
+        send(self(), {:backlog_open_page, query})
+
+        {:ok,
+         %{
+           status: 200,
+           body: [raw_issue(1), raw_issue(2) |> put_in(["status", "name"], "In Progress")]
+         }}
+    end
+
+    assert {:ok, issues} =
+             BacklogClient.fetch_open_issues_for_test(
+               ["Resolved", "Closed"],
+               tracker_settings(),
+               request_fun
+             )
+
+    # Intake covers the whole open board, so a ticket nobody has moved into an
+    # active column still shows up for the operator to start.
+    assert Enum.map(issues, & &1.state) == ["Open", "In Progress"]
+    assert_receive {:backlog_open_page, %{"statusId[]" => [1, 2]}}
+  end
+
+  test "client moves a Backlog issue into the requested status" do
+    issue = BacklogClient.normalize_issue_for_test(raw_issue(42), tracker_settings())
+
+    request_fun = fn
+      "GET", "/projects/TEST/statuses", %{}, nil, _settings ->
+        {:ok,
+         %{
+           status: 200,
+           body: [%{"id" => 1, "name" => "Open"}, %{"id" => 2, "name" => "In Progress"}]
+         }}
+
+      "PATCH", path, %{}, form, _settings ->
+        send(self(), {:backlog_patch, path, form})
+
+        {:ok, %{status: 200, body: raw_issue(42) |> put_in(["status", "name"], "In Progress")}}
+    end
+
+    assert {:ok, updated} =
+             BacklogClient.update_issue_state_for_test(
+               issue,
+               "in progress",
+               tracker_settings(),
+               request_fun
+             )
+
+    assert updated.state == "In Progress"
+    assert_receive {:backlog_patch, "/issues/TEST-42", %{"statusId" => 2}}
+
+    assert {:error, {:backlog_unknown_status, "Shipped"}} =
+             BacklogClient.update_issue_state_for_test(
+               issue,
+               "Shipped",
+               tracker_settings(),
+               request_fun
+             )
   end
 
   test "client skips issue queries when requested Backlog states do not exist" do

@@ -30,6 +30,34 @@ defmodule SymphonyElixir.Tracker.Memory do
      end)}
   end
 
+  @spec fetch_open_issues([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_open_issues(terminal_states) do
+    excluded =
+      terminal_states
+      |> Enum.map(&normalize_state/1)
+      |> MapSet.new()
+
+    {:ok,
+     Enum.reject(issue_entries(), fn %Issue{state: state} ->
+       MapSet.member?(excluded, normalize_state(state))
+     end)}
+  end
+
+  @spec update_issue_state(Issue.t(), String.t()) :: {:ok, Issue.t()} | {:error, term()}
+  def update_issue_state(%Issue{id: issue_id} = issue, state_name) do
+    updated = %Issue{issue | state: state_name}
+
+    replaced =
+      Enum.map(configured_issues(), fn
+        %Issue{id: ^issue_id} -> updated
+        other -> other
+      end)
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, replaced)
+
+    {:ok, updated}
+  end
+
   @spec secret_environment_names(map()) :: [String.t()]
   def secret_environment_names(_tracker_settings), do: []
 

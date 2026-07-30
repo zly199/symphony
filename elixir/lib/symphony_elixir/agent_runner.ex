@@ -226,7 +226,7 @@ defmodule SymphonyElixir.AgentRunner do
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
     case issue_state_fetcher.([issue_id]) do
       {:ok, [%Issue{} = refreshed_issue | _]} ->
-        if active_issue_state?(refreshed_issue.state) and issue_routable?(refreshed_issue) do
+        if open_issue_state?(refreshed_issue.state) and issue_routable?(refreshed_issue) do
           {:continue, refreshed_issue}
         else
           {:done, refreshed_issue}
@@ -242,14 +242,17 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp continue_with_issue?(issue, _issue_state_fetcher), do: {:done, issue}
 
-  defp active_issue_state?(state_name) when is_binary(state_name) do
+  # Turns keep coming until the ticket is finished. Which open column it sits in
+  # is not the runner's business: the operator's start released this work, and only
+  # a terminal state or the dashboard takes it back.
+  defp open_issue_state?(state_name) when is_binary(state_name) do
     normalized_state = normalize_issue_state(state_name)
 
-    Config.settings!().tracker.active_states
-    |> Enum.any?(fn active_state -> normalize_issue_state(active_state) == normalized_state end)
+    Config.settings!().tracker.terminal_states
+    |> Enum.all?(fn terminal_state -> normalize_issue_state(terminal_state) != normalized_state end)
   end
 
-  defp active_issue_state?(_state_name), do: false
+  defp open_issue_state?(_state_name), do: false
 
   defp issue_routable?(%Issue{} = issue) do
     Issue.routable?(issue, Config.settings!().tracker.required_labels)

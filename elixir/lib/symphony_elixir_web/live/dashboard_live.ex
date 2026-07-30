@@ -86,6 +86,63 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   @impl true
+  def handle_event("start_issue", %{"issue-id" => issue_id, "identifier" => identifier}, socket) do
+    socket =
+      case Orchestrator.start_issue(issue_id, identifier: identifier, updated_by: "dashboard") do
+        {:ok, record} ->
+          socket
+          |> put_flash(:info, start_flash(identifier, record))
+          |> assign(:payload, load_payload())
+
+        {:error, reason} ->
+          put_flash(socket, :error, "开始调度 #{identifier} 失败：#{inspect(reason)}")
+
+        :unavailable ->
+          put_flash(socket, :error, "编排器未运行，无法调度 #{identifier}。")
+      end
+
+    {:noreply, assign(socket, :now, DateTime.utc_now())}
+  end
+
+  @impl true
+  def handle_event("pause_issue", %{"issue-id" => issue_id, "identifier" => identifier}, socket) do
+    socket =
+      case Orchestrator.pause_issue(issue_id, identifier: identifier, paused_by: "dashboard") do
+        {:ok, _record} ->
+          socket
+          |> put_flash(:info, "已暂停 #{identifier}，在恢复之前不再派发。")
+          |> assign(:payload, load_payload())
+
+        {:error, reason} ->
+          put_flash(socket, :error, "暂停 #{identifier} 失败：#{inspect(reason)}")
+
+        :unavailable ->
+          put_flash(socket, :error, "编排器未运行，无法暂停 #{identifier}。")
+      end
+
+    {:noreply, assign(socket, :now, DateTime.utc_now())}
+  end
+
+  @impl true
+  def handle_event("resume_issue", %{"issue-id" => issue_id, "identifier" => identifier}, socket) do
+    socket =
+      case Orchestrator.resume_issue(issue_id, identifier: identifier) do
+        {:ok, _record} ->
+          socket
+          |> put_flash(:info, "已恢复 #{identifier}，下一轮轮询会重新派发。")
+          |> assign(:payload, load_payload())
+
+        {:error, reason} ->
+          put_flash(socket, :error, "恢复 #{identifier} 失败：#{inspect(reason)}")
+
+        :unavailable ->
+          put_flash(socket, :error, "编排器未运行，无法恢复 #{identifier}。")
+      end
+
+    {:noreply, assign(socket, :now, DateTime.utc_now())}
+  end
+
+  @impl true
   def render(assigns) do
     ~H"""
     <section class="dashboard-shell">
@@ -128,9 +185,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
       <% else %>
         <section class="metric-grid">
           <article class="metric-card">
-            <p class="metric-label"><%= tracker_source_label(@payload.tracker.source) %> 当前票</p>
+            <p class="metric-label"><%= tracker_source_label(@payload.tracker.source) %> 待处理票</p>
             <p class="metric-value numeric"><%= @payload.counts.tracker_active %></p>
-            <p class="metric-detail">票源中符合活动状态的票数。</p>
+            <p class="metric-detail">票源中尚未关闭、已进入 Symphony 的票数。</p>
           </article>
 
           <article class="metric-card">
@@ -152,6 +209,18 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </article>
 
           <article class="metric-card">
+            <p class="metric-label">等待调度</p>
+            <p class="metric-value numeric"><%= @payload.counts.waiting %></p>
+            <p class="metric-detail">已进入 Symphony、等待手动开始的票数。</p>
+          </article>
+
+          <article class="metric-card">
+            <p class="metric-label">已暂停</p>
+            <p class="metric-value numeric"><%= @payload.counts.paused %></p>
+            <p class="metric-detail">已手动暂停、恢复前不再派发的问题数。</p>
+          </article>
+
+          <article class="metric-card">
             <p class="metric-label">令牌总数</p>
             <p class="metric-value numeric"><%= format_int(@payload.codex_totals.total_tokens) %></p>
             <p class="metric-detail numeric">
@@ -169,9 +238,11 @@ defmodule SymphonyElixirWeb.DashboardLive do
         <section class="section-card">
           <div class="section-header">
             <div>
-              <h2 class="section-title"><%= tracker_source_label(@payload.tracker.source) %> 当前票</h2>
+              <h2 class="section-title"><%= tracker_source_label(@payload.tracker.source) %> 待处理票</h2>
               <p class="section-copy">
-                直接展示票源返回的活动票；工作区安全门仅控制代理调度。
+                票源里所有未关闭的票都会进来，默认停在「等待调度」，不跑、不花 token。
+                点「开始调度」才会真正派发，同时把票源状态改成 <%= start_state_label(@payload.tracker.active_states) %>。
+                推进不下去的票可以「暂停推进」：会停掉正在跑的会话，并一直停在已阻塞区，直到手动「恢复推进」。
                 <%= if @payload.tracker.synced_at do %>
                   最近同步：<span class="mono numeric"><%= @payload.tracker.synced_at %></span>
                 <% end %>
@@ -180,7 +251,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </div>
 
           <%= if @payload.tracker.issues == [] do %>
-            <p class="empty-state">票源当前没有符合活动状态的票。</p>
+            <p class="empty-state">票源当前没有未关闭的票。</p>
           <% else %>
             <div class="table-wrap">
               <table class="data-table" style="min-width: 900px;">
@@ -192,6 +263,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <th>代理状态</th>
                     <th>分类</th>
                     <th>更新时间</th>
+                    <th>操作</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -212,6 +284,13 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     </td>
                     <td><%= format_labels(entry.labels) %></td>
                     <td class="mono numeric"><%= entry.updated_at || "暂无" %></td>
+                    <td>
+                      <.gate_actions
+                        issue_id={entry.issue_id}
+                        identifier={entry.issue_identifier}
+                        run_status={entry.run_status}
+                      />
+                    </td>
                   </tr>
                 </tbody>
               </table>
@@ -314,8 +393,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
             <div>
               <h2 class="section-title">已阻塞的会话</h2>
               <p class="section-copy">
-                等待人工处理的问题：系分已产出待批准、Codex 请求输入，或连续多轮无进展。
+                等待人工处理的问题：系分已产出待批准、Codex 请求输入、连续多轮无进展，或被手动暂停。
                 系分文档可以直接批准，也可以写下修改意见打回；意见会随下一轮系分交给 Codex。
+                已暂停的票会一直停在这里，只有点「恢复推进」才会重新排期。
               </p>
             </div>
           </div>
@@ -371,7 +451,16 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     </td>
                     <td><%= entry.error || "暂无" %></td>
                     <td>
-                      <.analysis_gate_actions entry={entry} />
+                      <div class="action-stack">
+                        <.gate_actions
+                          issue_id={entry.issue_id}
+                          identifier={entry.issue_identifier}
+                          run_status={entry.run_status}
+                        />
+                        <%= if entry.run_status != :paused do %>
+                          <.analysis_gate_actions entry={entry} />
+                        <% end %>
+                      </div>
                     </td>
                   </tr>
                 </tbody>
@@ -476,6 +565,56 @@ defmodule SymphonyElixirWeb.DashboardLive do
     """
   end
 
+  attr(:issue_id, :string, required: true)
+  attr(:identifier, :string, required: true)
+  attr(:run_status, :atom, default: :waiting)
+
+  # One control per row, showing the only move that makes sense for where the item
+  # is: start it, pause it, or pick it back up. Every row carries it, because a
+  # ticket stops being worth pushing at any point in its run — including after a
+  # restart, which is why a paused row still offers the way back out.
+  defp gate_actions(assigns) do
+    ~H"""
+    <%= if @run_status == :waiting do %>
+      <button
+        type="button"
+        class="start-button"
+        phx-click="start_issue"
+        phx-value-issue-id={@issue_id}
+        phx-value-identifier={@identifier}
+        data-confirm={"开始调度 #{@identifier}？Codex 会开始跑并消耗 token。"}
+      >
+        开始调度
+      </button>
+    <% end %>
+
+    <%= if @run_status == :paused do %>
+      <button
+        type="button"
+        class="resume-button"
+        phx-click="resume_issue"
+        phx-value-issue-id={@issue_id}
+        phx-value-identifier={@identifier}
+      >
+        恢复推进
+      </button>
+    <% end %>
+
+    <%= if @run_status == :started do %>
+      <button
+        type="button"
+        class="pause-button"
+        phx-click="pause_issue"
+        phx-value-issue-id={@issue_id}
+        phx-value-identifier={@identifier}
+        data-confirm={"暂停 #{@identifier}？正在跑的会话会被停掉，恢复前不再派发。"}
+      >
+        暂停推进
+      </button>
+    <% end %>
+    """
+  end
+
   attr(:entry, :map, required: true)
 
   # A gated analysis needs both answers, not just "approve": rejecting it without
@@ -532,8 +671,6 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </details>
         <% end %>
       </div>
-    <% else %>
-      <span class="muted">无需操作</span>
     <% end %>
     """
   end
@@ -637,7 +774,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
       String.contains?(normalized, ["blocked", "error", "failed"]) ->
         "#{base} state-badge-danger"
 
-      String.contains?(normalized, ["todo", "queued", "pending", "retry", "waiting"]) ->
+      String.contains?(normalized, ["todo", "queued", "pending", "retry", "waiting", "paused"]) ->
         "#{base} state-badge-warning"
 
       true ->
@@ -655,7 +792,25 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp runtime_status_label("running"), do: "运行中"
   defp runtime_status_label("retrying"), do: "重试中"
   defp runtime_status_label("blocked"), do: "已阻塞"
+  defp runtime_status_label("paused"), do: "已暂停"
+  defp runtime_status_label("queued"), do: "排队中"
   defp runtime_status_label(_status), do: "等待调度"
+
+  # The tracker write can fail while the start itself holds, so the flash says which
+  # of the two happened instead of a flat "done".
+  defp start_flash(identifier, %{tracker_state: {:ok, state_name}}) do
+    "已开始调度 #{identifier}，票源状态已改为 #{state_name}。"
+  end
+
+  defp start_flash(identifier, %{tracker_state: {:error, reason}}) do
+    "已开始调度 #{identifier}，但票源状态未能更新（#{inspect(reason)}），请手动确认。"
+  end
+
+  defp start_state_label(active_states) when is_list(active_states) do
+    Enum.find(active_states, "进行中", &(is_binary(&1) and String.trim(&1) != ""))
+  end
+
+  defp start_state_label(_active_states), do: "进行中"
 
   defp format_labels(labels) when is_list(labels) and labels != [], do: Enum.join(labels, "、")
   defp format_labels(_labels), do: "暂无"
