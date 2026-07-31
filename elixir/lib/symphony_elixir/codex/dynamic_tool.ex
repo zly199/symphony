@@ -8,7 +8,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   @review_handoff_tool "symphony_handoff_for_review"
   @review_handoff_spec %{
     "name" => @review_handoff_tool,
-    "description" => "Hand completed implementation to the operator for review. Call only after CI is terminal-successful and every required local review and quality gate has passed.",
+    "description" => "Hand completed work to the operator for review. Call only after CI is terminal-successful and every required local review and quality gate has passed. This is how a ticket ends: the operator decides what happens next, and merging the merge request is theirs to do by hand — never merge it yourself.",
     "inputSchema" => %{
       "type" => "object",
       "additionalProperties" => false,

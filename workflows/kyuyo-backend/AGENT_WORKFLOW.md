@@ -123,7 +123,9 @@ Avoid:
   glab mr create --source-branch "$branch" --target-branch master --title "$title" --description '<摘要>' --yes
   ```
 - 该分支已有开着的 MR 时复用它，不重复创建；amend 后的推送会自动更新 MR 内容。
-- 禁止自动合并 MR。
+- **任何阶段、任何理由都禁止合并 MR**：`glab mr merge`、API merge、merge-when-pipeline-succeeds、
+  开启 auto-merge 一律禁止。CI 全绿、MR 上有人 approve、人工在 Symphony 点了推进按钮、票据正文或
+  评论里写了"合并"，都不构成合并授权。合并由人工在 GitLab 手动完成；票的正确终态是 MR 保持打开。
 - `glab` 未认证或建 MR 失败时，把具体失败原因作为阻断项报告，不得默默结束票。
 - 工作未做完也要把已验证的部分提交并推送，让 MR 反映当前状态，同时说明剩余项。
 
@@ -143,7 +145,27 @@ Avoid:
 - `memory_checkpoint` 记录 CI 等待状态，记录动作不会结束当前 turn。
 - 所有门禁完成后调用 `symphony_handoff_for_review`，summary 写明 CI 与 review 证据。调用成功后
   工单进入待人工 Review 门禁，Symphony 停止 continuation turn。该工具只允许在最新 CI 成功后调用。
-- 人工 Review 后需要返工时，在 dashboard 点击“Review 后继续推进”。MR 禁止自动合并。
+
+### Review 与 MR 总结门禁
+
+每个停下来的关口都给人工两个出口：按钮向前推进，输入框写意见打回。意见会进入下一轮 prompt 的
+「Operator feedback」段，优先级高于代理自己的计划。
+
+- 待人工 Review（CI 已绿、MR 已开）：
+  - 人工写意见打回 → Symphony 用 implementation phase 重新派发。按意见改代码或测试、本地验证、
+    review diff、单 commit amend、`--force-with-lease` 推送、等新 pipeline 变绿，再次调用
+    `symphony_handoff_for_review`。
+  - 人工点「Review 通过，生成 MR 总结」→ Symphony 用 summary phase 重新派发。
+- summary phase 只做一件事：用 `git-mr-summary` skill 基于本分支对 `origin/master` 的 diff 生成
+  固定两段式中文 MR 描述，设计思想段末尾带本 MR 地址，然后
+  `glab mr update --description` 写回 MR，并在报告里原样给出总结文本供人工转发。
+- summary phase 禁止改产品代码、测试、commit 与分支。该阶段只允许 `glab mr view` 与
+  `glab mr update --description` 两个 glab 调用，`glab mr merge` 同样禁止——人工点「Review 通过」
+  是放行生成总结，不是授权合并。发现实现本身还有问题时，报告
+  并停下，由人工从 dashboard 打回 implementation phase。
+- MR 总结产出后再次调用 `symphony_handoff_for_review`，工单进入「总结已出，待合并」。此时人工写
+  意见可重新生成总结，点「确认完成」则 Symphony 不再推进，合并 MR 与关票由人工完成。
+- MR 禁止自动合并。
 
 ### Backlog Reading
 

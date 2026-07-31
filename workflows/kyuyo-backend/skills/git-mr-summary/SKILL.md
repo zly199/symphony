@@ -40,6 +40,9 @@ Generate MR description text with a strict, reusable format.
 - If a class only has formatting changes, mark it as formatting-only instead of inventing behavior changes.
 
 3. Write design rationale like a normal mail or ticket reply.
+- Section 1 is read by a human in a chat window before they open the diff. Assume they stop
+  reading after a screen. Section 2 carries the detail; section 1 carries only what a reviewer
+  needs to know before looking.
 - Do not write one big official summary paragraph.
 - Write 2-5 short numbered points when the change actually has multiple points.
 - Organize the points by feature/function area first, not by sentence variety or by implementation detail.
@@ -53,7 +56,25 @@ Generate MR description text with a strict, reusable format.
 - Do not use contrast or rhetorical patterns such as `不是...而是...`, `不再...而是...`, `不仅...也...`, `不只...还...`, or similar variants. Rewrite them as simple statements.
 - Keep the tone blunt and practical. Write like a developer replying in mail, ticket, or MR, not like a weekly report.
 
-4. Emit final Markdown only.
+4. End section 1 with the merge request URL.
+- Resolve the URL from the merge request for the current branch:
+  ```sh
+  glab mr view --output json | python3 -c 'import json,sys; print(json.load(sys.stdin)["web_url"])'
+  ```
+  Fall back to `glab mr list --source-branch "$(git branch --show-current)"` when the first command
+  finds nothing.
+- Put it on its own line as the last line of section 1, after the numbered points. It is what the
+  reader clicks, so nothing follows it in that section.
+- When a reviewer is named — by the user, the ticket, or the merge request's assignee — write one
+  short request line above the URL, for example `麻烦@<姓名> review 下了，感谢：`. With no named
+  reviewer, write `MR：` and the URL alone. Never invent a name.
+- When no merge request exists yet, write `MR：待创建` instead of guessing a URL, and say so in your
+  report rather than in the output.
+- Reading the merge request is all this skill does with it. `glab mr merge`, auto-merge, and
+  merge-when-pipeline-succeeds are prohibited: this skill produces description text, and merging is
+  a human decision taken by hand.
+
+5. Emit final Markdown only.
 - Return only the final template content.
 - Do not include analysis process, command logs, or "maybe/possibly" wording.
 - Output must be directly pasteable into a `.md` file without further cleanup.
@@ -70,6 +91,9 @@ Always output the following Markdown structure exactly (raw Markdown text, no co
 3. <如果涉及版本边界、前后端配合、删除废弃逻辑、兼容性约束，也直接单列。>
 4. <如果有多个 API，就逐行列 method + path + 作用，一行一个。>
 
+麻烦@<review 人姓名> review 下了，感谢：
+<merge request URL>
+
 ## 2. 修改详情
 1. <类名A><br>
 <该类的精确修改点与行为变化。>
@@ -80,6 +104,11 @@ Always output the following Markdown structure exactly (raw Markdown text, no co
 ## Quality Bar
 
 - Section 1 must read like normal engineering communication. No official, inflated, or generic wording.
+- Section 1 is capped: at most 5 numbered points, at most 3 sentences per point, and no point longer
+  than roughly 150 Chinese characters. Over the cap means it has not been summarized yet — cut the
+  implementation detail, which belongs in section 2, and rewrite.
+- Section 1 must end with the merge request URL on its own line. Nothing comes after it in that
+  section.
 - Prefer short direct sentences over abstract summaries.
 - Use declarative sentences only.
 - Group section 1 by function points.
@@ -98,3 +127,5 @@ Always output the following Markdown structure exactly (raw Markdown text, no co
 - Do not fabricate classes, methods, or business effects.
 - If the base branch is unknown, assume the repository default branch silently and continue.
 - Keep output strictly limited to the two required sections; no extra heading/paragraph before or after.
+- Never invent a reviewer name and never invent a merge request URL. Read both, or leave them out.
+- Never merge the merge request. This skill only reads it and returns text.

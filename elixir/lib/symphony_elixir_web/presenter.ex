@@ -246,8 +246,7 @@ defmodule SymphonyElixirWeb.Presenter do
       review_approved: MapSet.member?(review_approved, issue_id),
       # What the orchestrator is doing with the item only matters once the operator
       # has released it; before that the row's own gate status is the honest answer.
-      runtime_status:
-        runtime_status(run_status, runtime_statuses, issue_id, MapSet.member?(review_approved, issue_id))
+      runtime_status: runtime_status(run_status, runtime_statuses, issue_id, MapSet.member?(review_approved, issue_id))
     }
   end
 

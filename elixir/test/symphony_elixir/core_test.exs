@@ -1359,6 +1359,116 @@ defmodule SymphonyElixir.CoreTest do
     assert AgentRunner.phase_for(issue) == :analysis
   end
 
+  test "approving the review sends the ticket into the merge-request summary phase" do
+    issue_id = "issue-review-approve"
+    orchestrator_name = Module.concat(__MODULE__, :ReviewApproveOrchestrator)
+    {:ok, pid} = start_continuation_orchestrator(orchestrator_name)
+
+    issue = %Issue{id: issue_id, identifier: "MT-990", state: "In Progress"}
+
+    {:ok, _record} = ApprovalStore.approve(issue_id, identifier: "MT-990")
+    {:ok, _record} = DispatchGate.handoff_for_review(issue_id, identifier: "MT-990")
+
+    run_continuation_turn(pid, issue_id, issue)
+    assert %{block_reason: :awaiting_human_review} = :sys.get_state(pid).blocked[issue_id]
+    assert AgentRunner.phase_for(issue) == :implementation
+
+    assert {:ok, record} =
+             Orchestrator.advance_issue(pid, issue_id, identifier: "MT-990", approved_by: "tester")
+
+    assert record.decision == :approve_review
+    assert ApprovalStore.review_approved?(issue_id)
+
+    # The handoff parked it at the review gate; approving has to release that gate
+    # too, or the summary run it authorizes would never be dispatched.
+    assert DispatchGate.started?(issue_id)
+    refute Map.has_key?(:sys.get_state(pid).blocked, issue_id)
+    assert AgentRunner.phase_for(issue) == :summary
+  end
+
+  test "a handoff after the summary parks the ticket for merging instead of for review" do
+    issue_id = "issue-summary-handoff"
+    orchestrator_name = Module.concat(__MODULE__, :SummaryHandoffOrchestrator)
+    {:ok, pid} = start_continuation_orchestrator(orchestrator_name)
+
+    issue = %Issue{id: issue_id, identifier: "MT-991", state: "In Progress"}
+
+    {:ok, _record} = ApprovalStore.approve_review(issue_id, identifier: "MT-991")
+    {:ok, _record} = DispatchGate.handoff_for_review(issue_id, identifier: "MT-991")
+
+    run_continuation_turn(pid, issue_id, issue)
+
+    assert %{block_reason: :awaiting_merge, error: error} = :sys.get_state(pid).blocked[issue_id]
+    assert error =~ "summary written"
+
+    # Nothing is left for Symphony, so continuing here ends the ticket rather than
+    # dispatching another run.
+    assert {:ok, record} = Orchestrator.advance_issue(pid, issue_id, identifier: "MT-991")
+    assert record.decision == :finish
+    assert DispatchGate.paused?(issue_id)
+  end
+
+  test "review feedback returns the ticket to implementation and keeps the analysis approval" do
+    issue_id = "issue-review-feedback"
+    orchestrator_name = Module.concat(__MODULE__, :ReviewFeedbackOrchestrator)
+    {:ok, pid} = start_continuation_orchestrator(orchestrator_name)
+
+    issue = %Issue{id: issue_id, identifier: "MT-992", state: "In Progress"}
+
+    {:ok, _record} = ApprovalStore.approve(issue_id, identifier: "MT-992")
+    {:ok, _record} = DispatchGate.handoff_for_review(issue_id, identifier: "MT-992")
+    run_continuation_turn(pid, issue_id, issue)
+
+    assert {:ok, note} =
+             Orchestrator.submit_feedback(pid, issue_id,
+               note: "空指针分支没有测试",
+               identifier: "MT-992"
+             )
+
+    assert note.phase == "implementation"
+
+    # The operator rejected the code, not the plan, so the item goes back to
+    # implementation rather than all the way back to analysis.
+    assert ApprovalStore.approved?(issue_id)
+    refute ApprovalStore.review_approved?(issue_id)
+    assert DispatchGate.started?(issue_id)
+    assert AgentRunner.phase_for(issue) == :implementation
+    refute Map.has_key?(:sys.get_state(pid).blocked, issue_id)
+  end
+
+  test "summary feedback re-runs the summary phase instead of the implementation" do
+    issue_id = "issue-summary-feedback"
+    orchestrator_name = Module.concat(__MODULE__, :SummaryFeedbackOrchestrator)
+    {:ok, pid} = start_continuation_orchestrator(orchestrator_name)
+
+    issue = %Issue{id: issue_id, identifier: "MT-993", state: "In Progress"}
+
+    {:ok, _record} = ApprovalStore.approve_review(issue_id, identifier: "MT-993")
+    {:ok, _record} = DispatchGate.handoff_for_review(issue_id, identifier: "MT-993")
+    run_continuation_turn(pid, issue_id, issue)
+
+    assert {:ok, note} =
+             Orchestrator.submit_feedback(pid, issue_id,
+               note: "设计思想第一条太长",
+               identifier: "MT-993"
+             )
+
+    assert note.phase == "summary"
+    assert ApprovalStore.review_approved?(issue_id)
+    assert DispatchGate.started?(issue_id)
+    assert AgentRunner.phase_for(issue) == :summary
+  end
+
+  test "the advance decision names what continuing does at each gate" do
+    assert Orchestrator.advance_decision(:waiting, nil, false) == :start
+    assert Orchestrator.advance_decision(:paused, :operator_paused, false) == :resume
+    assert Orchestrator.advance_decision(:started, :awaiting_analysis_approval, false) == :approve_analysis
+    assert Orchestrator.advance_decision(:started, :input_required, false) == :redispatch
+    assert Orchestrator.advance_decision(:started, :analysis_incomplete, false) == :redispatch
+    assert Orchestrator.advance_decision(:review, :awaiting_human_review, false) == :approve_review
+    assert Orchestrator.advance_decision(:review, :awaiting_merge, true) == :finish
+  end
+
   test "blank feedback is rejected instead of re-running the analysis" do
     issue_id = "issue-analysis-revision-blank"
     orchestrator_name = Module.concat(__MODULE__, :AnalysisRevisionBlankOrchestrator)

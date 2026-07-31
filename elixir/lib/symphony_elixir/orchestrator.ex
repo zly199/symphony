@@ -1828,6 +1828,31 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @typedoc "What `advance_issue/3` does for an item parked at a given gate."
+  @type advance_decision ::
+          :start | :resume | :approve_analysis | :approve_review | :finish | :redispatch
+
+  @doc """
+  Returns the decision `advance_issue/3` would take, given where an item stopped.
+
+  Public and pure because the dashboard labels its button with it: a label derived
+  separately from the action it triggers is a label that eventually lies about
+  what pressing it does.
+  """
+  @spec advance_decision(DispatchGate.status(), atom() | nil, boolean()) :: advance_decision()
+  def advance_decision(:waiting, _block_reason, _review_approved), do: :start
+  def advance_decision(:paused, _block_reason, _review_approved), do: :resume
+
+  # The review gate is reached twice — once for the implementation, once for the
+  # summary written after it — and the review approval is what tells them apart.
+  def advance_decision(:review, _block_reason, true), do: :finish
+  def advance_decision(:review, _block_reason, _review_approved), do: :approve_review
+
+  def advance_decision(:started, :awaiting_analysis_approval, _review_approved),
+    do: :approve_analysis
+
+  def advance_decision(_run_status, _block_reason, _review_approved), do: :redispatch
+
   @doc """
   Records operator feedback on `issue_id` at whichever gate it is parked at, and
   sends it back for another pass of the phase that feedback belongs to.
@@ -2073,7 +2098,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_call({:advance_issue, issue_id, opts}, _from, state) do
-    advance_from_gate(state, issue_id, opts, advance_decision(state, issue_id))
+    advance_from_gate(state, issue_id, opts, decision_for(state, issue_id))
   end
 
   def handle_call({:start_issue, issue_id, opts}, _from, state) do
@@ -2110,27 +2135,12 @@ defmodule SymphonyElixir.Orchestrator do
      }, state}
   end
 
-  # What "keep going" means at each gate. The item's own state answers it, so the
-  # dashboard can offer one button everywhere instead of asking the operator to
-  # work out which of five decisions this particular stop needs.
-  defp advance_decision(%State{} = state, issue_id) do
-    case DispatchGate.status(issue_id) do
-      :waiting ->
-        :start
-
-      :paused ->
-        :resume
-
-      :review ->
-        # The review gate is used twice: once for the implementation, once for the
-        # summary written after it. The review approval says which one this is.
-        if ApprovalStore.review_approved?(issue_id), do: :finish, else: :approve_review
-
-      :started ->
-        if blocked_reason(state, issue_id) == :awaiting_analysis_approval,
-          do: :approve_analysis,
-          else: :redispatch
-    end
+  defp decision_for(%State{} = state, issue_id) do
+    advance_decision(
+      DispatchGate.status(issue_id),
+      blocked_reason(state, issue_id),
+      ApprovalStore.review_approved?(issue_id)
+    )
   end
 
   defp advance_from_gate(%State{} = state, issue_id, opts, decision) do
@@ -2292,10 +2302,6 @@ defmodule SymphonyElixir.Orchestrator do
       _ -> nil
     end
   end
-
-  @doc false
-  @spec advance_decision_for_test(term(), String.t()) :: atom()
-  def advance_decision_for_test(%State{} = state, issue_id), do: advance_decision(state, issue_id)
 
   @doc false
   @spec feedback_phase_for_test(term(), String.t()) :: atom()

@@ -4,6 +4,7 @@ defmodule SymphonyElixir.ExtensionsTest do
   import Phoenix.ConnTest
   import Phoenix.LiveViewTest
 
+  alias SymphonyElixir.ApprovalStore
   alias SymphonyElixir.OperatorFeedback
   alias SymphonyElixir.DispatchGate
   alias SymphonyElixir.Linear.Adapter
@@ -325,6 +326,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                      |> List.first()
                      |> Map.fetch!("updated_at"),
                    "run_status" => "waiting",
+                   "review_approved" => false,
                    "runtime_status" => "waiting"
                  }
                ]
@@ -370,7 +372,8 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "error" => "codex turn requires operator input",
                  "block_reason" => "input_required",
                  "run_status" => "waiting",
-                 "analysis_feedback" => [],
+                 "review_approved" => false,
+                 "feedback" => [],
                  "worker_host" => "dm-dev2",
                  "workspace_path" => "/workspaces/MT-BLOCKED",
                  "session_id" => "thread-blocked",
@@ -669,6 +672,10 @@ defmodule SymphonyElixir.ExtensionsTest do
         })
       ])
 
+    # An item only reaches this gate by having been started, and the gate status
+    # is what tells the dashboard the pending decision is an approval.
+    {:ok, _record} = DispatchGate.start("issue-blocked", identifier: "MT-BLOCKED")
+
     {:ok, _pid} =
       StaticOrchestrator.start_link(name: orchestrator_name, snapshot: gated_snapshot)
 
@@ -677,16 +684,69 @@ defmodule SymphonyElixir.ExtensionsTest do
     {:ok, view, html} = live(build_conn(), "/")
 
     assert html =~ "批准继续"
-    assert html =~ "打回修改"
+    assert html =~ "提交意见并重跑"
     assert html =~ ~s(name="note")
 
     html = submit_revision(view, "第 3 节缺少数据流")
 
     assert html =~ "已记录 MT-BLOCKED 的修改意见"
-    assert [%{note: "第 3 节缺少数据流", identifier: "MT-BLOCKED"}] = OperatorFeedback.notes("issue-blocked")
+
+    assert [%{note: "第 3 节缺少数据流", identifier: "MT-BLOCKED", phase: "analysis"}] =
+             OperatorFeedback.notes("issue-blocked")
 
     assert submit_revision(view, "   ") =~ "请先填写需要修改的内容"
     assert length(OperatorFeedback.notes("issue-blocked")) == 1
+  end
+
+  test "dashboard liveview offers both answers at the review and summary gates" do
+    orchestrator_name = Module.concat(__MODULE__, :ReviewGateDashboardOrchestrator)
+    snapshot = static_snapshot()
+
+    review_snapshot =
+      put_in(snapshot.blocked, [
+        snapshot.blocked
+        |> List.first()
+        |> Map.merge(%{
+          error: "implementation gates passed; waiting for operator review",
+          block_reason: :awaiting_human_review
+        })
+      ])
+
+    {:ok, _record} = DispatchGate.handoff_for_review("issue-blocked", identifier: "MT-BLOCKED")
+    {:ok, _approval} = ApprovalStore.approve("issue-blocked", identifier: "MT-BLOCKED")
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(name: orchestrator_name, snapshot: review_snapshot)
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    {:ok, view, html} = live(build_conn(), "/")
+
+    # Before the review is signed off, continuing means "write the summary" and
+    # feedback means "go back and change the code".
+    assert html =~ "Review 通过，生成 MR 总结"
+    assert html =~ "回到编码阶段"
+
+    assert submit_revision(view, "空指针分支没覆盖") =~ "会回到编码阶段修改并重跑 CI"
+
+    assert [%{phase: "implementation"}] = OperatorFeedback.notes("issue-blocked")
+    # Review feedback corrects code, so the analysis approval survives it.
+    assert ApprovalStore.approved?("issue-blocked")
+    assert DispatchGate.started?("issue-blocked")
+
+    # After the sign-off the same two controls mean "regenerate the summary" and
+    # "this ticket is done".
+    {:ok, _approval} = ApprovalStore.approve_review("issue-blocked", identifier: "MT-BLOCKED")
+    {:ok, _record} = DispatchGate.handoff_for_review("issue-blocked", identifier: "MT-BLOCKED")
+
+    {:ok, view, html} = live(build_conn(), "/")
+
+    assert html =~ "确认完成"
+    assert html =~ "重新生成总结"
+
+    assert submit_revision(view, "第一段太长，压到三句") =~ "会重新生成 MR 总结"
+    assert [%{phase: "implementation"}, %{phase: "summary"}] = OperatorFeedback.notes("issue-blocked")
+    assert ApprovalStore.review_approved?("issue-blocked")
   end
 
   test "dashboard liveview walks a ticket from waiting through started and paused" do
@@ -709,48 +769,49 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     {:ok, view, _html} = live(build_conn(), "/")
 
+    # Whatever the state, the row offers both a way forward and a way to say what
+    # is wrong; only the label on the forward button changes.
     assert has_element?(view, "form.revision-form")
+    assert has_element?(view, gate_button("advance_issue", "issue-tracked"))
+    assert has_element?(view, gate_button("advance_issue", "issue-blocked"))
 
-    # Nothing has been released yet, so every row offers a start and no row offers
-    # a way to stop something that is not running.
-    assert has_element?(view, gate_button("start_issue", "issue-tracked"))
-    assert has_element?(view, gate_button("start_issue", "issue-blocked"))
+    # Nothing has been released yet, so no row offers a way to stop something that
+    # is not running.
     refute has_element?(view, gate_button("pause_issue", "issue-blocked"))
-    refute has_element?(view, gate_button("resume_issue", "issue-blocked"))
+    assert render(view) =~ "开始调度"
 
-    html = click_gate(view, "start_issue")
+    html = click_advance(view)
 
     assert html =~ "已开始调度 MT-BLOCKED"
     assert DispatchGate.started?("issue-blocked")
     assert has_element?(view, gate_button("pause_issue", "issue-blocked"))
-    refute has_element?(view, gate_button("start_issue", "issue-blocked"))
+    assert render(view) =~ "批准继续"
 
-    html = click_gate(view, "pause_issue")
+    html = view |> element(gate_button("pause_issue", "issue-blocked")) |> render_click()
 
     assert html =~ "已暂停 MT-BLOCKED"
     assert DispatchGate.paused?("issue-blocked")
-    assert has_element?(view, gate_button("resume_issue", "issue-blocked"))
     refute has_element?(view, gate_button("pause_issue", "issue-blocked"))
+    assert render(view) =~ "恢复推进"
 
-    # A paused ticket is out of the rotation, so the analysis gate stops asking
-    # for a decision on it.
-    refute has_element?(view, "form.revision-form")
+    # A paused ticket still takes feedback: the operator's note is what the run
+    # picks up when they resume it.
+    assert has_element?(view, "form.revision-form")
 
-    html = click_gate(view, "resume_issue")
+    html = click_advance(view)
 
     assert html =~ "已恢复 MT-BLOCKED"
     assert DispatchGate.started?("issue-blocked")
     assert has_element?(view, gate_button("pause_issue", "issue-blocked"))
-    refute has_element?(view, gate_button("resume_issue", "issue-blocked"))
   end
 
   defp gate_button(event, issue_id) do
     "button[phx-click=#{event}][phx-value-issue-id=#{issue_id}]"
   end
 
-  defp click_gate(view, event) do
+  defp click_advance(view) do
     view
-    |> element(gate_button(event, "issue-blocked"))
+    |> element(gate_button("advance_issue", "issue-blocked"))
     |> render_click()
   end
 

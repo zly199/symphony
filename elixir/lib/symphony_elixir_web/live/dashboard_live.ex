@@ -547,10 +547,14 @@ defmodule SymphonyElixirWeb.DashboardLive do
   # operator presses the same button, and the orchestrator works out which
   # decision this state needs.
   defp advance_action(assigns) do
+    decision =
+      Orchestrator.advance_decision(assigns.run_status, assigns.block_reason, assigns.review_approved)
+
     assigns =
       assigns
-      |> assign(:label, advance_label(assigns.run_status, assigns.block_reason, assigns.review_approved))
-      |> assign(:class, advance_class(assigns.run_status, assigns.block_reason))
+      |> assign(:label, advance_label(decision))
+      |> assign(:class, advance_class(decision))
+      |> assign(:confirm, advance_confirm(decision, assigns.identifier))
 
     ~H"""
     <button
@@ -559,7 +563,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
       phx-click="advance_issue"
       phx-value-issue-id={@issue_id}
       phx-value-identifier={@identifier}
-      data-confirm={advance_confirm(@identifier, @run_status, @block_reason, @review_approved)}
+      data-confirm={@confirm}
     >
       <%= @label %>
     </button>
@@ -773,32 +777,31 @@ defmodule SymphonyElixirWeb.DashboardLive do
   # The label has to name the decision, not the mechanism: an operator pressing
   # this needs to know whether they are spending tokens, approving a plan, or
   # ending the ticket.
-  defp advance_label(:waiting, _block_reason, _review_approved), do: "开始调度"
-  defp advance_label(:paused, _block_reason, _review_approved), do: "恢复推进"
-  defp advance_label(:review, _block_reason, true), do: "确认完成"
-  defp advance_label(:review, _block_reason, _review_approved), do: "Review 通过，生成 MR 总结"
-  defp advance_label(:started, :awaiting_analysis_approval, _review_approved), do: "批准继续"
-  defp advance_label(:started, :analysis_incomplete, _review_approved), do: "重跑系分"
-  defp advance_label(_run_status, _block_reason, _review_approved), do: "继续推进"
+  defp advance_label(:start), do: "开始调度"
+  defp advance_label(:resume), do: "恢复推进"
+  defp advance_label(:approve_analysis), do: "批准继续"
+  defp advance_label(:approve_review), do: "Review 通过，生成 MR 总结"
+  defp advance_label(:finish), do: "确认完成"
+  defp advance_label(_decision), do: "继续推进"
 
-  defp advance_class(:waiting, _block_reason), do: "start-button"
-  defp advance_class(:paused, _block_reason), do: "resume-button"
-  defp advance_class(_run_status, _block_reason), do: "approve-button"
+  defp advance_class(:start), do: "start-button"
+  defp advance_class(:resume), do: "resume-button"
+  defp advance_class(_decision), do: "approve-button"
 
   # Only the moves that spend tokens or end the ticket are worth a confirmation.
-  defp advance_confirm(identifier, :waiting, _block_reason, _review_approved),
+  defp advance_confirm(:start, identifier),
     do: "开始调度 #{identifier}？Codex 会开始跑并消耗 token。"
 
-  defp advance_confirm(identifier, :review, _block_reason, true),
-    do: "确认 #{identifier} 已完成？Symphony 不再推进，合并 MR 与关票由你手动完成。"
-
-  defp advance_confirm(identifier, :review, _block_reason, _review_approved),
-    do: "确认 #{identifier} 的实现与 CI 没问题？Codex 会用 git-mr-summary 生成 MR 总结。"
-
-  defp advance_confirm(identifier, :started, :awaiting_analysis_approval, _review_approved),
+  defp advance_confirm(:approve_analysis, identifier),
     do: "批准 #{identifier} 进入编码阶段？"
 
-  defp advance_confirm(_identifier, _run_status, _block_reason, _review_approved), do: nil
+  defp advance_confirm(:approve_review, identifier),
+    do: "确认 #{identifier} 的实现与 CI 没问题？Codex 会用 git-mr-summary 生成 MR 总结。"
+
+  defp advance_confirm(:finish, identifier),
+    do: "确认 #{identifier} 已完成？Symphony 不再推进，合并 MR 与关票由你手动完成。"
+
+  defp advance_confirm(_decision, _identifier), do: nil
 
   # The placeholder is the only thing telling the operator which artifact this box
   # sends back, and each gate sends back a different one.
