@@ -47,14 +47,23 @@ launchctl list | grep symphony
   不派发、不起 Codex、不花 token。在 dashboard 的票列表点「开始调度」才会真正开跑，同时把票源状态改成
   `active_states` 的第一项（Backlog 配置里是 `In Progress`）。票源状态改失败不影响本地开跑，dashboard 会提示。
   决定持久化在 `var/dispatch_gate.json`，编排重启后仍然有效；票进入终态后记录会被清掉，重新打开的票会回到「等待调度」。
-- **每个停下来的关口都有两个出口**：一个向前推进的按钮，一个写意见打回的输入框。意见持久化在
+- **每个关口都先给产物，再给两个出口**。Codex 每个阶段结束前必须调用 `symphony_publish_artifact`
+  交付本阶段产物，dashboard 把它渲染在按钮正上方——没有产物就没法确认，所以
+  `symphony_handoff_for_review` 在产物缺失时直接拒绝。产物存在 `var/artifacts/<issue id>/<phase>.json`，
+  在 `/artifacts/<issue id>/<phase>` 阅读，票进终态时随 worktree 一起回收。
+  三个阶段的产物分别是：系分 HTML、review 包（改了什么 + commit + MR 地址 + CI 结论 + 验证结果 +
+  diffstat + 风险）、MR 总结正文。
+- 两个出口：一个向前推进的按钮，一个写意见打回的输入框。意见持久化在
   `var/operator_feedback.json`，并随下一轮提示词交给 Codex，重跑的是这一关对应的阶段。
   票在「已阻塞」区依次经过这些关口：
-  - 系分产出后 → 点「批准继续」进入编码；或写意见打回，重跑系分。
+  - 系分产出后 → 读系分产物，点「批准继续」进入编码；或写意见打回，重跑系分。
   - 编码完成、CI 变绿、MR 已开后（Codex 调用 `symphony_handoff_for_review`）→ 点「Review 通过，生成 MR 总结」，
-    Codex 会用 `git-mr-summary` skill 生成固定两段式中文 MR 描述（设计思想段末尾带 MR 地址）并写回 MR；
+    Codex 会用 `git-mr-summary` skill 生成固定两段式中文 MR 描述（设计思想段末尾带 MR 地址），
+    先发布成本阶段产物再写回 MR；
     或写意见打回，回到编码阶段改代码、amend、重推、重跑 CI，**系分批准不会因此作废**。
   - MR 总结产出后 → 点「确认完成」，Symphony 不再推进，合并 MR 与关票由人工完成；或写意见打回，重新生成总结。
+  - summary phase 跑完却没发布总结产物 → 这一关标成「总结未产出」，按钮变成「重新生成 MR 总结」，
+    点它或写意见都会重跑 summary phase；这一关不给「确认完成」，避免确认一份读不到的总结。
   - Codex 请求输入、连续多轮无进展等其他阻塞，同样是「继续推进」加意见框，重跑当前阶段。
   阶段决定持久化在 `var/approvals.json`（系分批准与 review 批准各记一次）。
 - 推进不下去的票可以点「暂停推进」（票列表和已阻塞区都有）：正在跑的会话会被立刻停掉，票一直停在「已阻塞」区，

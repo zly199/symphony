@@ -232,6 +232,9 @@ def list_ticket_merge_requests(repo: Path, ticket: str, project: str) -> list[Me
             continue
         if is_generated_mr(title, source_branch):
             continue
+        # glab --merged still returns closed MRs, so keep only actually merged ones.
+        if not item.get("merged_at"):
+            continue
 
         iid = int(item["iid"])
         if iid in seen_iids:

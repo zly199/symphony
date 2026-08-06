@@ -53,24 +53,31 @@ At every gate the operator has two moves — accept and move to the next phase, 
 back with written corrections. Corrections arrive in this prompt under "Operator feedback" and
 outrank your own plan. Ending your turn is how you hand control back; never ask to continue.
 
+**Every phase ends by publishing its deliverable with `symphony_publish_artifact`.** That artifact
+is the only thing the operator sees when they decide; the dashboard shows it beside the approve
+button. A phase that ends without one asks a human to approve something they cannot read, so the
+tool is not optional and not a summary of where the work lives — the body carries the work itself.
+Write it in Chinese, self-contained, and assume the reader opens nothing else.
+
 {% if phase == "analysis" %}
 ## Analysis phase — no product code
 
-Your single deliverable is the system-analysis document. Writing, editing, or refactoring product
-code in this phase is out of scope, even when the fix looks obvious.
+Your single deliverable is the system-analysis document, published as this phase's artifact.
+Writing, editing, or refactoring product code in this phase is out of scope, even when the fix
+looks obvious.
 
 1. Fetch the issue and its comments, read the referenced code, and understand the real cause.
-2. Write the analysis to
-   `/Users/user/IdeaProjects/kyuyo-backend/ai-workspace/docs/tickets/{{ issue.identifier }}/index.html`,
-   following the repository's fixed 7 sections, and register the link in
-   `/Users/user/IdeaProjects/kyuyo-backend/ai-workspace/docs/index.html`. This shared `ai-workspace`
-   is excluded from Git and remains available to every ticket worktree.
-3. Audit the document with the `system-analysis-review` skill before delivering. A failed audit
-   means rewrite and audit again.
-4. Finish with a short report naming the root cause, the proposed change, and the document path.
-   Then stop. A human reviews the analysis on the Symphony dashboard and either approves it — the
-   implementation phase starts only after that approval — or sends it back with written
-   corrections, which re-runs this phase with those corrections in the prompt.
+2. Write the analysis with the repository's fixed 7 sections, as one self-contained HTML document.
+3. Audit it with the `system-analysis-review` skill before delivering. A failed audit means rewrite
+   and audit again.
+4. Publish it with `symphony_publish_artifact`, `format: "html"`, title
+   `{{ issue.identifier }} 系分`, and the whole document as the body. This is the deliverable —
+   the operator reads it on the dashboard, so it does not go into a file under the ticket and it is
+   not registered in any docs index.
+5. Finish with a short report naming the root cause and the proposed change, then stop. A human
+   reads the artifact on the Symphony dashboard and either approves it — the implementation phase
+   starts only after that approval — or sends it back with written corrections, which re-runs this
+   phase with those corrections in the prompt.
 
 Do not implement, do not add `ai-workspace` to Git, do not commit or push, do not open a merge
 request, and do not ask to continue. Ending your turn is how you hand control back.
@@ -78,8 +85,14 @@ request, and do not ask to continue. Ending your turn is how you hand control ba
 ## Summary phase — implementation reviewed and accepted
 
 A human read the merge request and accepted the change. The branch, its single commit, the merge
-request, and its green pipeline are final. Your only deliverable is the merge request's Chinese
-description, written with the `git-mr-summary` skill.
+request, and its green pipeline are final. Your only deliverable is the Chinese merge-request
+description the `git-mr-summary` skill returns, and it goes to two places: published with
+`symphony_publish_artifact` as this phase's artifact, and written to the merge request itself.
+
+The skill's rule that it returns the Markdown and nothing else governs its text, not your turn.
+The text is the deliverable, not the last thing you say: printing it in your report leaves the
+gate empty, because the operator reads the artifact, not the transcript. Publish the exact text
+the skill returned — same two sections, same wording — with `format: "markdown"`.
 
 Do not touch product code, tests, the commit, or the branch. The only `glab` calls this phase may
 make are `glab mr view` and `glab mr update --description`; `glab mr merge` and anything else that
@@ -91,13 +104,23 @@ it back to implementation from the dashboard, which is the only way back into co
 {% else %}
 ## Implementation phase — analysis already approved
 
-A human approved the analysis document at
-`/Users/user/IdeaProjects/kyuyo-backend/ai-workspace/docs/tickets/{{ issue.identifier }}/index.html`.
-Read it first; it is the agreed plan and you implement against it rather than re-deriving an
+A human approved the analysis artifact this ticket published in its analysis phase. Read it first
+at `/artifacts/{{ issue.id }}/analysis` on the Symphony dashboard host, or from your own analysis
+run's output; it is the agreed plan and you implement against it rather than re-deriving an
 approach.
 
-Update the document only when implementation reveals the plan was wrong, and say so in your
-report when you do.
+When implementation reveals the plan was wrong, publish a corrected analysis artifact with
+`symphony_publish_artifact` and say so in your report.
+
+This phase's own artifact is the review packet the operator reads before approving the change.
+Publish it with `symphony_publish_artifact` right before the handoff, in Chinese, containing:
+
+- what changed and why, per file or class
+- the commit subject and the merge request URL
+- the CI result: pipeline id, conclusion, and what the failing jobs were if any were retried
+- the validation you ran and its exact outcome
+- `git diff --stat origin/master...HEAD`, and the full diff when it is small enough to read
+- anything you would want a reviewer to look at hardest, and any risk you are leaving behind
 {% endif %}
 
 {% if feedback.count > 0 %}
@@ -110,15 +133,15 @@ of them, and do not hand the ticket back until each is answered.
 {% for item in feedback.notes %}- `[{{ item.phase }}]` {{ item.note }}
   _(raised {{ item.requested_at }}{% unless item.delivered %}, not yet seen by any run{% endunless %})_
 {% endfor %}
-{% if phase == "analysis" %}Rewrite
-`/Users/user/IdeaProjects/kyuyo-backend/ai-workspace/docs/tickets/{{ issue.identifier }}/index.html`
-to answer them and re-run the `system-analysis-review` audit.
-{% elsif phase == "summary" %}Regenerate the merge-request description with the `git-mr-summary` skill so it answers them, and
-publish it to the merge request again.
+{% if phase == "analysis" %}Rewrite the analysis document to answer them, re-run the `system-analysis-review` audit, and
+publish the corrected document with `symphony_publish_artifact` again.
+{% elsif phase == "summary" %}Regenerate the merge-request description with the `git-mr-summary` skill so it answers them, then
+publish it again — both as the artifact and to the merge request.
 {% else %}Fix the implementation so it answers them: change the code or tests, run the affected local
 validation, review the diff, amend the ticket's single commit, push with `--force-with-lease`,
-and wait for the new pipeline. Call `symphony_handoff_for_review` again only after that pipeline
-is green.
+and wait for the new pipeline. Publish an updated review packet with `symphony_publish_artifact`
+naming what each note changed, then call `symphony_handoff_for_review` again — only after that
+pipeline is green.
 {% endif %}
 In your closing report, state point by point how each note was addressed.
 {% endif %}
@@ -206,10 +229,11 @@ Operating rules:
 13. Do not claim completion while required validation is failing.
 14. Do not change Backlog status, categories, assignee, or comments unless the ticket explicitly
     requests it or the workflow below authorizes it.
-15. Keep exactly one product-code commit on the ticket branch. The shared analysis document is
-    excluded from Git; never add, commit, or push any file under `ai-workspace`. The implementation
-    phase creates the ticket commit, then amends that same commit for later changes. Never stack a
-    second commit, and never rewrite commits that already exist on `origin/master`.
+15. Keep exactly one product-code commit on the ticket branch. Phase deliverables live in Symphony
+    as artifacts, not in the repository; never add, commit, or push any file under `ai-workspace`.
+    The implementation phase creates the ticket commit, then amends that same commit for later
+    changes. Never stack a second commit, and never rewrite commits that already exist on
+    `origin/master`.
 16. Creating a merge request belongs to the implementation phase only; the summary phase rewrites
     its description and changes nothing else. Once code is committed and pushed,
     the ticket branch must have an open merge request targeting `master`; creating it is part of
@@ -246,17 +270,22 @@ Execution workflow:
 {% if phase == "analysis" %}
 4. Read the ticket, its comments, the referenced code, and any design material until you can name
    the concrete cause and the concrete change, both grounded in file paths and identifiers.
-5. Write
-   `/Users/user/IdeaProjects/kyuyo-backend/ai-workspace/docs/tickets/{{ issue.identifier }}/index.html`
-   with the fixed 7 sections, and register its link in
-   `/Users/user/IdeaProjects/kyuyo-backend/ai-workspace/docs/index.html`.
-6. Audit the document with the `system-analysis-review` skill. Rewrite and re-audit until it
-   passes; an unaudited document is not deliverable.
-7. Report the root cause, the proposed change, and the document path, then end your turn. Do not
-   open a merge request and do not start implementation. A human then either approves on the
-   Symphony dashboard, and Symphony re-dispatches this ticket in the implementation phase, or
-   rejects it with corrections, and Symphony re-dispatches this ticket in the analysis phase with
-   those corrections listed above.
+5. Write the analysis as one self-contained HTML document with the fixed 7 sections.
+6. Audit it with the `system-analysis-review` skill. Rewrite and re-audit until it passes; an
+   unaudited document is not deliverable.
+7. Publish it with `symphony_publish_artifact`:
+
+   ```json
+   {"title": "{{ issue.identifier }} 系分", "format": "html", "body": "<the whole document>"}
+   ```
+
+   Nothing is written under `ai-workspace/docs/tickets/` and nothing is registered in
+   `ai-workspace/docs/index.html`; the artifact is the deliverable.
+8. Report the root cause and the proposed change, then end your turn. Do not open a merge request
+   and do not start implementation. A human then either approves on the Symphony dashboard, and
+   Symphony re-dispatches this ticket in the implementation phase, or rejects it with corrections,
+   and Symphony re-dispatches this ticket in the analysis phase with those corrections listed
+   above.
 {% elsif phase == "summary" %}
 4. Confirm the ticket branch is checked out, carries its single commit, and has an open merge
    request. Read the merge request and its URL:
@@ -269,25 +298,32 @@ Execution workflow:
    instead of creating one here.
 5. Run the `git-mr-summary` skill over this branch's diff against `origin/master`. It returns the
    fixed two-section Chinese description, and section 1 ends with this merge request's URL.
-6. Write that text to
-   `/Users/user/IdeaProjects/kyuyo-backend/ai-workspace/docs/tickets/{{ issue.identifier }}/mr.md`
-   and publish it as the merge request's description:
+6. Publish that text with `symphony_publish_artifact`, before touching the merge request — it is
+   what the operator reads, copies, and pastes into the review request, and doing it first means a
+   failing `glab` call costs you the description update, not the deliverable:
 
-   ```sh
-   glab mr update --description "$(cat /Users/user/IdeaProjects/kyuyo-backend/ai-workspace/docs/tickets/{{ issue.identifier }}/mr.md)"
+   ```json
+   {"title": "{{ issue.identifier }} MR 总结", "format": "markdown", "body": "<the summary text>"}
    ```
 
-   Write only inside `ai-workspace`; the worktree stays clean, and nothing under `ai-workspace`
-   is ever added to Git.
-7. Report the merge-request URL and the full summary text in your closing report, so the operator
-   can paste it into the review request without opening the merge request.
+   The body is the skill's output verbatim, both sections included. Reporting the text instead of
+   publishing it ends the phase with an empty gate.
+
+7. Write the same text to the merge request's description. Keep it out of the worktree so the
+   branch stays clean — a here-doc, or a scratch file under `ai-workspace`:
+
+   ```sh
+   glab mr update --description "$(cat "$SUMMARY_FILE")"
+   ```
+
 8. Call `symphony_handoff_for_review` with a one-line note that the summary is published. This
-   parks the ticket for the operator's final check. Never merge the merge request, never amend the
-   commit, and never push product-code changes in this phase.
+   parks the ticket for the operator's final check; the tool refuses until step 6 has run, and a
+   turn that ends without it parks the ticket as an unfinished summary instead. Never merge the
+   merge request, never amend the commit, and never push product-code changes in this phase.
 {% else %}
-4. Read
-   `/Users/user/IdeaProjects/kyuyo-backend/ai-workspace/docs/tickets/{{ issue.identifier }}/index.html`.
-   It is the approved plan; implement against it instead of forming a new approach.
+4. Read the approved analysis artifact at
+   `http://127.0.0.1:4000/artifacts/{{ issue.id }}/analysis`. It is the approved plan; implement
+   against it instead of forming a new approach.
 5. Implement the smallest complete change.
 6. Review the diff for correctness, security, compatibility, and missing tests.
 7. Run the relevant Maven/module tests and any repository-required checks.
@@ -338,19 +374,23 @@ Execution workflow:
     correctness, security, compatibility, or test-coverage findings, and the MR has no unresolved
     actionable feedback. Findings that change the branch require another amend, push, and complete
     CI wait.
-14. Call `symphony_handoff_for_review` with a concise gate summary only after step 13 passes. This
-    parks the ticket for operator review and prevents continuation turn #2. Never call it while CI
-    is pending or failing. Never merge the MR.
+14. Publish the review packet with `symphony_publish_artifact` (`format: "markdown"`, title
+    `{{ issue.identifier }} 实现与 CI`). Its contents are listed in this phase's section above. This
+    is what the operator reads to decide, so write the evidence into the body rather than pointing
+    at the merge request or the log. `symphony_handoff_for_review` refuses to run until it exists.
+15. Call `symphony_handoff_for_review` with a concise gate summary only after steps 13 and 14 pass.
+    This parks the ticket for operator review and prevents continuation turn #2. Never call it while
+    CI is pending or failing. Never merge the MR.
 
     The operator then does one of two things on the dashboard. They send the merge request back
     with written corrections, and Symphony re-dispatches this ticket in the implementation phase
     with those corrections at the top of the prompt; or they accept it, and Symphony re-dispatches
     this ticket in the summary phase to write the merge-request description. Either way the next
     move is theirs — do not keep working after the handoff call.
-15. Finish with a compact report of changes, commit, merge-request URL, validation, CI result, and
+16. Finish with a compact report of changes, commit, merge-request URL, validation, CI result, and
     blockers.
     When work is incomplete, still commit and push what is validated so the merge request reflects
-    the current state, and continue working through steps 11–14 unless a proven external blocker
+    the current state, and continue working through steps 11–15 unless a proven external blocker
     prevents progress.
 {% endif %}
 

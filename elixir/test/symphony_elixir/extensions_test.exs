@@ -5,6 +5,7 @@ defmodule SymphonyElixir.ExtensionsTest do
   import Phoenix.LiveViewTest
 
   alias SymphonyElixir.ApprovalStore
+  alias SymphonyElixir.Artifact
   alias SymphonyElixir.OperatorFeedback
   alias SymphonyElixir.DispatchGate
   alias SymphonyElixir.Linear.Adapter
@@ -327,6 +328,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                      |> Map.fetch!("updated_at"),
                    "run_status" => "waiting",
                    "review_approved" => false,
+                   "block_reason" => nil,
                    "runtime_status" => "waiting"
                  }
                ]
@@ -346,6 +348,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "recent_events" => [
                    %{"at" => nil, "event" => "notification", "message" => "rendered"}
                  ],
+                 "artifacts" => [],
                  "started_at" => state_payload["running"] |> List.first() |> Map.fetch!("started_at"),
                  "last_event_at" => nil,
                  "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
@@ -373,6 +376,9 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "block_reason" => "input_required",
                  "run_status" => "waiting",
                  "review_approved" => false,
+                 "gate_phase" => "analysis",
+                 "artifact" => nil,
+                 "artifacts" => [],
                  "feedback" => [],
                  "worker_host" => "dm-dev2",
                  "workspace_path" => "/workspaces/MT-BLOCKED",
@@ -701,6 +707,7 @@ defmodule SymphonyElixir.ExtensionsTest do
   test "dashboard liveview offers both answers at the review and summary gates" do
     orchestrator_name = Module.concat(__MODULE__, :ReviewGateDashboardOrchestrator)
     snapshot = static_snapshot()
+    on_exit(fn -> Artifact.clear("issue-blocked") end)
 
     review_snapshot =
       put_in(snapshot.blocked, [
@@ -727,6 +734,25 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Review 通过，生成 MR 总结"
     assert html =~ "回到编码阶段"
 
+    # The gate has to show what it is asking about. Nothing was published, so it
+    # says so rather than presenting a bare approve button.
+    assert html =~ "这一轮没有产出可确认的产物"
+
+    {:ok, _artifact} =
+      Artifact.put("issue-blocked", :implementation, %{
+        identifier: "MT-BLOCKED",
+        title: "MT-BLOCKED 实现与 CI",
+        format: "markdown",
+        body: "## 变更\npipeline 123 succeeded"
+      })
+
+    {:ok, _view, html} = live(build_conn(), "/")
+
+    assert html =~ "MT-BLOCKED 实现与 CI"
+    assert html =~ "/artifacts/issue-blocked/implementation"
+    assert html =~ "点开查看这一关的产物"
+    refute html =~ "这一轮没有产出可确认的产物"
+
     assert submit_revision(view, "空指针分支没覆盖") =~ "会回到编码阶段修改并重跑 CI"
 
     assert [%{phase: "implementation"}] = OperatorFeedback.notes("issue-blocked")
@@ -739,10 +765,24 @@ defmodule SymphonyElixir.ExtensionsTest do
     {:ok, _approval} = ApprovalStore.approve_review("issue-blocked", identifier: "MT-BLOCKED")
     {:ok, _record} = DispatchGate.handoff_for_review("issue-blocked", identifier: "MT-BLOCKED")
 
+    {:ok, _artifact} =
+      Artifact.put("issue-blocked", :summary, %{
+        identifier: "MT-BLOCKED",
+        title: "MT-BLOCKED MR 总结",
+        format: "markdown",
+        body: "## 1. 设计思想\n1. 改了 FooService"
+      })
+
     {:ok, view, html} = live(build_conn(), "/")
 
     assert html =~ "确认完成"
     assert html =~ "重新生成总结"
+
+    # The gate moved on, so the artifact it shows moves with it — and the earlier
+    # phase stays reachable from the row.
+    assert html =~ "MT-BLOCKED MR 总结"
+    assert html =~ "/artifacts/issue-blocked/summary"
+    assert html =~ "/artifacts/issue-blocked/implementation"
 
     assert submit_revision(view, "第一段太长，压到三句") =~ "会重新生成 MR 总结"
     assert [%{phase: "implementation"}, %{phase: "summary"}] = OperatorFeedback.notes("issue-blocked")
@@ -1021,89 +1061,55 @@ defmodule SymphonyElixir.ExtensionsTest do
     end
   end
 
-  describe "analysis document route" do
+  describe "artifact route" do
     setup do
-      identifier = "MT-DOC"
-      workspace = Path.join(Config.local_workspace_root(), Workspace.workspace_key(identifier))
-
-      # Analysis documents and assets share the source repository's ai-workspace.
-      repository = Path.join(System.tmp_dir!(), "symphony-elixir-doc-repo-#{System.unique_integer([:positive])}")
-      repository_docs = Path.join(repository, "ai-workspace/docs")
-
-      File.mkdir_p!(Path.join(repository_docs, "assets"))
-      File.write!(Path.join(repository_docs, "assets/docs.css"), ".diagram-caption { color: red; }")
-      File.mkdir_p!(Path.join(repository_docs, "tickets/#{identifier}"))
-
-      File.write!(
-        Path.join(repository_docs, "tickets/#{identifier}/index.html"),
-        "<h1>系分 MT-DOC</h1>"
-      )
-
-      File.write!(Path.join(repository, "repo-secret.txt"), "must not be served")
-
-      write_workflow_file!(Workflow.workflow_file_path(), workspace_repository: repository)
-
-      File.mkdir_p!(workspace)
-      File.write!(Path.join(workspace, "secret.txt"), "must not be served")
-
       start_test_endpoint([])
-
-      on_exit(fn ->
-        File.rm_rf(workspace)
-        File.rm_rf(repository)
-      end)
-
-      %{identifier: identifier, workspace: workspace, repository: repository}
+      on_exit(fn -> Artifact.clear("issue-artifact") end)
+      :ok
     end
 
-    test "serves the analysis document and its relative assets", %{identifier: identifier} do
-      conn = get(build_conn(), "/analysis/#{identifier}/tickets/#{identifier}/index.html")
+    test "serves an html artifact as authored" do
+      {:ok, _artifact} =
+        Artifact.put("issue-artifact", :analysis, %{
+          identifier: "MT-DOC",
+          title: "MT-DOC 系分",
+          format: "html",
+          body: "<h1>系分 MT-DOC</h1>"
+        })
 
-      assert response(conn, 200) =~ "系分 MT-DOC"
+      conn = get(build_conn(), "/artifacts/issue-artifact/analysis")
+
+      assert response(conn, 200) == "<h1>系分 MT-DOC</h1>"
       assert response_content_type(conn, :html) =~ "text/html"
-
-      # The document links its stylesheet as ../../assets/docs.css, which
-      # resolves under the same shared-docs prefix.
-      css_conn = get(build_conn(), "/analysis/#{identifier}/assets/docs.css")
-
-      assert response(css_conn, 200) =~ "diagram-caption"
-      assert response_content_type(css_conn, :css) =~ "text/css"
     end
 
-    test "the repository fallback cannot serve files outside its docs tree", %{
-      identifier: identifier
-    } do
-      conn = get(build_conn(), "/analysis/#{identifier}/../repo-secret.txt")
+    test "wraps a markdown artifact in a readable page and escapes its body" do
+      {:ok, _artifact} =
+        Artifact.put("issue-artifact", :implementation, %{
+          identifier: "MT-DOC",
+          title: "MT-DOC 实现与 CI",
+          format: "markdown",
+          body: "## 变更\n<script>alert(1)</script>"
+        })
 
-      assert response(conn, 404)
+      body = response(get(build_conn(), "/artifacts/issue-artifact/implementation"), 200)
+
+      assert body =~ "MT-DOC 实现与 CI"
+      assert body =~ "## 变更"
+      # The body is the agent's prose, not markup to execute.
+      assert body =~ "&lt;script&gt;"
+      refute body =~ "<script>alert(1)</script>"
     end
 
-    test "redirects the bare identifier to the document", %{identifier: identifier} do
-      conn = get(build_conn(), "/analysis/#{identifier}")
-
-      assert redirected_to(conn) == "/analysis/#{identifier}/tickets/#{identifier}/index.html"
+    test "returns 404 for an unpublished phase and an unknown phase name" do
+      assert response(get(build_conn(), "/artifacts/issue-artifact/summary"), 404)
+      assert response(get(build_conn(), "/artifacts/issue-artifact/nonsense"), 404)
     end
 
-    test "refuses to escape the docs tree", %{identifier: identifier} do
-      conn = get(build_conn(), "/analysis/#{identifier}/../../secret.txt")
-
-      assert response(conn, 404)
-
-      escaped = get(build_conn(), "/analysis/#{identifier}/tickets/../../../secret.txt")
-
-      assert response(escaped, 404)
-    end
-
-    test "returns 404 for an unknown work item" do
-      conn = get(build_conn(), "/analysis/MT-NOPE/tickets/MT-NOPE/index.html")
-
-      assert response(conn, 404)
-    end
-
-    test "doc_exists? reports only real documents", %{identifier: identifier} do
-      assert SymphonyElixirWeb.AnalysisDocController.doc_exists?(identifier)
-      refute SymphonyElixirWeb.AnalysisDocController.doc_exists?("MT-NOPE")
-      refute SymphonyElixirWeb.AnalysisDocController.doc_exists?(nil)
+    # Ids come from the tracker, so a crafted one must not reach outside the
+    # artifacts directory.
+    test "a traversing issue id cannot read another file" do
+      assert response(get(build_conn(), "/artifacts/..%2F..%2Fapprovals/analysis"), 404)
     end
   end
 end

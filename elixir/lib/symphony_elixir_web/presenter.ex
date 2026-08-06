@@ -5,6 +5,7 @@ defmodule SymphonyElixirWeb.Presenter do
 
   alias SymphonyElixir.{
     ApprovalStore,
+    Artifact,
     Config,
     DispatchGate,
     OperatorFeedback,
@@ -137,6 +138,9 @@ defmodule SymphonyElixirWeb.Presenter do
       last_event: entry.last_codex_event,
       last_message: summarize_message(entry.last_codex_message),
       recent_events: recent_events_payload(entry),
+      # A run in flight has whatever earlier phases published, which is what makes
+      # the approved analysis readable while the implementation is still running.
+      artifacts: entry.issue_id |> Artifact.list() |> Enum.map(&artifact_payload/1),
       started_at: iso8601(entry.started_at),
       last_event_at: iso8601(entry.last_codex_timestamp),
       tokens: %{
@@ -161,15 +165,25 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp blocked_entry_payload(entry, gate_statuses, review_approved) do
+    block_reason = Map.get(entry, :block_reason, :input_required)
+    reviewed? = MapSet.member?(review_approved, entry.issue_id)
+    gate_phase = gate_phase(block_reason, entry.issue_id, reviewed?)
+
     %{
       issue_id: entry.issue_id,
       issue_identifier: entry.identifier,
       issue_url: Map.get(entry, :issue_url),
       state: entry.state,
       error: entry.error,
-      block_reason: Map.get(entry, :block_reason, :input_required),
+      block_reason: block_reason,
       run_status: run_status(gate_statuses, entry.issue_id),
-      review_approved: MapSet.member?(review_approved, entry.issue_id),
+      review_approved: reviewed?,
+      # The artifact this gate is asking about comes first; the earlier phases stay
+      # reachable, because reviewing an implementation means reading it against the
+      # analysis it was built from.
+      gate_phase: gate_phase,
+      artifact: artifact_payload(Artifact.fetch(entry.issue_id, gate_phase)),
+      artifacts: entry.issue_id |> Artifact.list() |> Enum.map(&artifact_payload/1),
       feedback: feedback_payload(entry.issue_id),
       worker_host: Map.get(entry, :worker_host),
       workspace_path: Map.get(entry, :workspace_path),
@@ -179,6 +193,39 @@ defmodule SymphonyElixirWeb.Presenter do
       last_message: summarize_message(entry.last_codex_message),
       recent_events: recent_events_payload(entry),
       last_event_at: iso8601(entry.last_codex_timestamp)
+    }
+  end
+
+  # Which phase's deliverable this gate is asking the operator to judge. The block
+  # reason names it wherever a phase ended at a gate; anything else — Codex asked
+  # for input, no tracker progress — is a stop inside a phase, so the current one
+  # is what they are looking at.
+  defp gate_phase(:awaiting_analysis_approval, _issue_id, _reviewed), do: :analysis
+  defp gate_phase(:analysis_incomplete, _issue_id, _reviewed), do: :analysis
+  defp gate_phase(:awaiting_merge, _issue_id, _reviewed), do: :summary
+  defp gate_phase(:summary_incomplete, _issue_id, _reviewed), do: :summary
+
+  # The review gate is reached twice, so a sign-off already on record means the
+  # operator is looking at the summary, not at the implementation again. This
+  # mirrors `Orchestrator.advance_decision/3`, which reads the same signal.
+  defp gate_phase(:awaiting_human_review, _issue_id, true), do: :summary
+  defp gate_phase(:awaiting_human_review, _issue_id, _reviewed), do: :implementation
+
+  defp gate_phase(_block_reason, issue_id, _reviewed),
+    do: SymphonyElixir.AgentRunner.phase_for(%{id: issue_id})
+
+  # Only the metadata travels in the payload: the body can be a whole analysis
+  # document, and this payload is rebuilt on every dashboard tick.
+  defp artifact_payload(nil), do: nil
+
+  defp artifact_payload(artifact) do
+    %{
+      phase: artifact.phase,
+      title: artifact.title,
+      format: artifact.format,
+      bytes: artifact.bytes,
+      published_at: artifact.published_at,
+      path: "/artifacts/#{URI.encode(artifact.issue_id)}/#{artifact.phase}"
     }
   end
 
@@ -231,6 +278,8 @@ defmodule SymphonyElixirWeb.Presenter do
   defp tracker_issue_payload(issue, runtime_statuses, gate_statuses, review_approved) do
     issue_id = Map.get(issue, :issue_id)
     run_status = run_status(gate_statuses, issue_id)
+    reviewed? = MapSet.member?(review_approved, issue_id)
+    block_reason = row_block_reason(issue_id, reviewed?)
 
     %{
       issue_id: issue_id,
@@ -243,24 +292,38 @@ defmodule SymphonyElixirWeb.Presenter do
       assignee_id: Map.get(issue, :assignee_id),
       updated_at: iso8601(Map.get(issue, :updated_at)),
       run_status: run_status,
-      review_approved: MapSet.member?(review_approved, issue_id),
+      review_approved: reviewed?,
+      block_reason: block_reason,
       # What the orchestrator is doing with the item only matters once the operator
       # has released it; before that the row's own gate status is the honest answer.
-      runtime_status: runtime_status(run_status, runtime_statuses, issue_id, MapSet.member?(review_approved, issue_id))
+      runtime_status: runtime_status(run_status, runtime_statuses, issue_id, block_reason, reviewed?)
     }
   end
 
   defp run_status(gate_statuses, issue_id), do: Map.get(gate_statuses, issue_id, :waiting)
 
-  defp runtime_status(:waiting, _runtime_statuses, _issue_id, _review_approved), do: "waiting"
-  defp runtime_status(:paused, _runtime_statuses, _issue_id, _review_approved), do: "paused"
+  # The row carries the same button as the gate card, so it needs the same answer
+  # about whether the summary phase delivered. A signed-off review with no summary
+  # artifact is not at the finish gate, whatever the dispatch status says, and a
+  # row that offered "确认完成" there would contradict the card right below it.
+  defp row_block_reason(issue_id, true) do
+    if Artifact.exists?(issue_id, :summary), do: nil, else: :summary_incomplete
+  end
+
+  defp row_block_reason(_issue_id, _reviewed), do: nil
+
+  defp runtime_status(:waiting, _runtime_statuses, _issue_id, _block_reason, _reviewed), do: "waiting"
+  defp runtime_status(:paused, _runtime_statuses, _issue_id, _block_reason, _reviewed), do: "paused"
+
+  defp runtime_status(_run_status, _runtime_statuses, _issue_id, :summary_incomplete, _reviewed),
+    do: "summary_missing"
 
   # The review gate is reached twice, and which side of the summary run an item is
   # on is the difference between "read this diff" and "merge it".
-  defp runtime_status(:review, _runtime_statuses, _issue_id, true), do: "merge_pending"
-  defp runtime_status(:review, _runtime_statuses, _issue_id, _review_approved), do: "review"
+  defp runtime_status(:review, _runtime_statuses, _issue_id, _block_reason, true), do: "merge_pending"
+  defp runtime_status(:review, _runtime_statuses, _issue_id, _block_reason, _reviewed), do: "review"
 
-  defp runtime_status(:started, runtime_statuses, issue_id, _review_approved),
+  defp runtime_status(:started, runtime_statuses, issue_id, _block_reason, _reviewed),
     do: Map.get(runtime_statuses, issue_id, "queued")
 
   defp running_issue_payload(running) do

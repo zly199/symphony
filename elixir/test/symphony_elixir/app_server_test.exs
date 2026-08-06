@@ -675,12 +675,18 @@ defmodule SymphonyElixir.AppServerTest do
                          "name" => "linear_graphql"
                        },
                        %{
+                         "description" => publish_description,
+                         "inputSchema" => %{"required" => ["title", "body"]},
+                         "name" => "symphony_publish_artifact"
+                       },
+                       %{
                          "description" => handoff_description,
                          "inputSchema" => %{"required" => ["summary"]},
                          "name" => "symphony_handoff_for_review"
                        }
                      ] ->
                        tracker_description =~ "Linear" and
+                         publish_description =~ "deliverable" and
                          handoff_description =~ "operator for review"
 
                      _ ->

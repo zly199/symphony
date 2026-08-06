@@ -146,6 +146,23 @@ Avoid:
 - 所有门禁完成后调用 `symphony_handoff_for_review`，summary 写明 CI 与 review 证据。调用成功后
   工单进入待人工 Review 门禁，Symphony 停止 continuation turn。该工具只允许在最新 CI 成功后调用。
 
+### 阶段产物门禁
+
+**每个阶段结束前必须调用 `symphony_publish_artifact` 交付本阶段产物。** 该产物是人工在 dashboard
+上唯一能看到的东西，按钮就在它旁边；没有产物就是让人工批准一个自己看不见的东西。产物正文用中文、
+自包含，假设读者不会再打开别的文件。`symphony_handoff_for_review` 在本阶段产物缺失时直接拒绝执行。
+
+- analysis：完整系分 HTML（`format: "html"`）。不再写
+  `ai-workspace/docs/tickets/<票号>/index.html`，也不在 `ai-workspace/docs/index.html` 登记；
+  产物本身就是交付物。`system-analysis-review` 审查在发布前完成。
+- implementation：review 包（`format: "markdown"`），内容含改了什么与为什么（按文件/类）、commit
+  与 MR 地址、CI pipeline id 与结论、跑过的验证与确切结果、`git diff --stat origin/master...HEAD`
+  （diff 小就贴全）、最该重点看的地方与遗留风险。
+- summary：MR 总结正文（`format: "markdown"`），与写回 MR description 的文本一致。
+
+产物按票号+阶段各存一份，重发即替换；票进入终态时随 worktree 一起回收。人工在
+`/artifacts/<issue id>/<phase>` 阅读。
+
 ### Review 与 MR 总结门禁
 
 每个停下来的关口都给人工两个出口：按钮向前推进，输入框写意见打回。意见会进入下一轮 prompt 的
@@ -157,14 +174,19 @@ Avoid:
     `symphony_handoff_for_review`。
   - 人工点「Review 通过，生成 MR 总结」→ Symphony 用 summary phase 重新派发。
 - summary phase 只做一件事：用 `git-mr-summary` skill 基于本分支对 `origin/master` 的 diff 生成
-  固定两段式中文 MR 描述，设计思想段末尾带本 MR 地址，然后
-  `glab mr update --description` 写回 MR，并在报告里原样给出总结文本供人工转发。
+  固定两段式中文 MR 描述，设计思想段末尾带本 MR 地址。这段文字要落两个地方，缺一不可：
+  先用 `symphony_publish_artifact`（`format: "markdown"`）原样发布为本阶段产物，再用
+  `glab mr update --description` 写回 MR。
+- skill 那条「只输出 Markdown、不加任何前后缀」约束的是文本本身，不是这一轮的动作。人工在
+  dashboard 上读的是产物，不是报告，所以只把总结贴在报告里等于这一关没有产物；这种情况工单会被
+  标成「总结未产出」，需要重跑 summary phase。
 - summary phase 禁止改产品代码、测试、commit 与分支。该阶段只允许 `glab mr view` 与
   `glab mr update --description` 两个 glab 调用，`glab mr merge` 同样禁止——人工点「Review 通过」
   是放行生成总结，不是授权合并。发现实现本身还有问题时，报告
   并停下，由人工从 dashboard 打回 implementation phase。
-- MR 总结产出后再次调用 `symphony_handoff_for_review`，工单进入「总结已出，待合并」。此时人工写
-  意见可重新生成总结，点「确认完成」则 Symphony 不再推进，合并 MR 与关票由人工完成。
+- MR 总结产物发布后再次调用 `symphony_handoff_for_review`，工单进入「总结已出，待合并」。该工具在
+  产物缺失时会直接拒绝。此时人工写意见可重新生成总结，点「确认完成」则 Symphony 不再推进，合并 MR
+  与关票由人工完成。
 - MR 禁止自动合并。
 
 ### Backlog Reading
@@ -191,7 +213,7 @@ Avoid:
 #### Roles
 
 - 过程记忆（进度、推导结论、决策、验证结果、下一步）一律进 agentmemory；禁止沉淀到票 HTML 或新增上下文 `.md`。
-- 票 HTML（`ai-workspace/docs/tickets/<票号>/index.html` 及各 hotfix 目录）只承担系分交付物职责，仅在票需要交付系分时按 Documentation Rules 编写，并在 `ai-workspace/docs/index.html` 注册链接。
+- 系分交付物由 `symphony_publish_artifact` 以 analysis 阶段产物交付（HTML，按 Documentation Rules 编写），不写入 `ai-workspace/docs/tickets/<票号>/index.html`，也不在 `ai-workspace/docs/index.html` 注册。设计书转换产物（`design.html`）仍留在票目录，它是输入快照而非交付物。
 - 三个治理文件仍是硬规则唯一权威；违反即事故的约束（Cosmos、分页 cursor 等）不迁入 agentmemory，不依赖检索命中。
 - Claude 原生 memory 卡（`~/.claude/projects/-Users-user-IdeaProjects-kyuyo-backend/memory/`）只放对 Claude 行为的约束类反馈；项目过程与领域经验一律进 agentmemory，禁止双写。
 
@@ -224,7 +246,7 @@ Avoid:
 
 ### HTML Asset Rules
 
-- 本节适用于系分交付 HTML：仅在票需要交付系分时编写；过程记忆见 Agent Memory。
+- 本节适用于系分交付 HTML：仅在票需要交付系分时编写，写完用 `symphony_publish_artifact` 发布为 analysis 阶段产物；过程记忆见 Agent Memory。
 - 文档页统一引用 `ai-workspace/docs/assets/docs.css` 与 `ai-workspace/docs/assets/docs.js`。
 - HTML 中避免重复写相同的内联 CSS / JS。
 - 系分交付 HTML 固定维护 7 个语义区块：目标、业务分析、数据分析、系统分析、修改方案、测试方案、上线方案。可选区块「修订历史&背景」按需出现，紧跟「目标」之后，承接从目标剥离的改訂履歴/版本归属/范围边界/来源背景等历史性内容；简单票（如纯技术票）无此类内容时直接省略，不留空壳。
@@ -342,7 +364,7 @@ Avoid:
 ### Analysis Output
 
 - 系统分析必须结果导向：先回答条件与结果，再解释原因。
-- 用户要求"分析当前票"、"分析票"、"看当前票"等 ticket 分析任务时，若已读取 Backlog/设计书/代码并形成结论，必须产出或更新 `ai-workspace/docs/tickets/<票号>/index.html` 系分文档；票目录缺少 `index.html` 时创建，交付前走 `system-analysis-review`，禁止只给口头分析。
+- 用户要求"分析当前票"、"分析票"、"看当前票"等 ticket 分析任务时，若已读取 Backlog/设计书/代码并形成结论，必须产出完整系分 HTML 并用 `symphony_publish_artifact` 发布为 analysis 阶段产物；交付前走 `system-analysis-review`，禁止只给口头分析。
 - 涉及多方案时，明确写出方案 A 结果、方案 B 结果、推荐结论。
 - 显式区分安全条件、风险条件、确定性问题、条件触发风险。
 - 所有风险结论都要给出最短调用链与关键触发点。

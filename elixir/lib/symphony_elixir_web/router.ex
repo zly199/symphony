@@ -29,8 +29,7 @@ defmodule SymphonyElixirWeb.Router do
   end
 
   scope "/", SymphonyElixirWeb do
-    get("/analysis/:issue_identifier", AnalysisDocController, :show)
-    get("/analysis/:workspace_key/*path", AnalysisDocController, :asset)
+    get("/artifacts/:issue_id/:phase", ArtifactController, :show)
   end
 
   scope "/", SymphonyElixirWeb do

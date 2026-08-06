@@ -56,6 +56,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
 
     assert Enum.map(BoundDynamicTool.bind().tool_specs, & &1["name"]) == [
+             "symphony_publish_artifact",
              "symphony_handoff_for_review"
            ]
 
@@ -89,19 +90,78 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
       state: "In Progress"
     }
 
-    response =
+    on_exit(fn -> SymphonyElixir.Artifact.clear(issue.id) end)
+
+    handoff = fn ->
       BoundDynamicTool.execute(
         "symphony_handoff_for_review",
         %{"summary" => "pipeline 123 succeeded; final diff review passed"},
         binding,
         issue: issue
       )
+    end
+
+    # Parking a ticket for review with nothing published would ask the operator to
+    # approve a status line, so the gate refuses to close.
+    refused = handoff.()
+
+    assert refused["success"] == false
+    assert refused["output"] =~ "symphony_publish_artifact"
+    refute SymphonyElixir.DispatchGate.review?(issue.id)
+
+    published =
+      BoundDynamicTool.execute(
+        "symphony_publish_artifact",
+        %{
+          "title" => "MT-REVIEW 实现与 CI",
+          "format" => "markdown",
+          "body" => "## 变更\n改了 FooService\n\npipeline 123 succeeded"
+        },
+        binding,
+        issue: issue
+      )
+
+    assert published["success"] == true
+
+    # The phase comes from the approval record, not from the caller.
+    assert %{phase: "analysis", title: "MT-REVIEW 实现与 CI", format: "markdown"} =
+             SymphonyElixir.Artifact.fetch(issue.id, :analysis)
+
+    response = handoff.()
 
     assert response["success"] == true
     assert SymphonyElixir.DispatchGate.review?(issue.id)
 
     assert %{status: :review, identifier: "MT-REVIEW", updated_by: "agent-review-handoff"} =
              SymphonyElixir.DispatchGate.fetch(issue.id)
+  end
+
+  test "publishing rejects an empty body and an unknown format" do
+    binding = BoundDynamicTool.bind()
+    issue = %Issue{id: "issue-artifact-invalid", identifier: "MT-ART", state: "In Progress"}
+
+    empty =
+      BoundDynamicTool.execute(
+        "symphony_publish_artifact",
+        %{"title" => "空的", "body" => "   "},
+        binding,
+        issue: issue
+      )
+
+    assert empty["success"] == false
+    assert empty["output"] =~ "full deliverable"
+
+    bad_format =
+      BoundDynamicTool.execute(
+        "symphony_publish_artifact",
+        %{"title" => "格式不对", "format" => "pdf", "body" => "内容"},
+        binding,
+        issue: issue
+      )
+
+    assert bad_format["success"] == false
+    assert bad_format["output"] =~ "markdown"
+    refute SymphonyElixir.Artifact.exists?(issue.id, :analysis)
   end
 
   test "linear_graphql returns successful GraphQL responses as tool text" do

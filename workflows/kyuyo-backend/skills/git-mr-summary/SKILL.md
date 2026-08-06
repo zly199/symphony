@@ -76,6 +76,9 @@ Generate MR description text with a strict, reusable format.
 
 5. Emit final Markdown only.
 - Return only the final template content.
+- This rule shapes the text, not the caller's turn. When the caller has somewhere to put the
+  description — a merge request, a host tool that publishes it, a file — putting it there is still
+  their job, and returning the text is not a substitute for delivering it.
 - Do not include analysis process, command logs, or "maybe/possibly" wording.
 - Output must be directly pasteable into a `.md` file without further cleanup.
 - Never wrap output in code fences such as ```markdown.

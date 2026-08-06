@@ -6,7 +6,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
   use Phoenix.LiveView, layout: {SymphonyElixirWeb.Layouts, :app}
 
   alias SymphonyElixir.Orchestrator
-  alias SymphonyElixirWeb.{AnalysisDocController, Endpoint, ObservabilityPubSub, Presenter}
+  alias SymphonyElixirWeb.{Endpoint, ObservabilityPubSub, Presenter}
   @runtime_tick_ms 1_000
 
   @impl true
@@ -263,6 +263,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                           issue_id={entry.issue_id}
                           identifier={entry.issue_identifier}
                           run_status={entry.run_status}
+                          block_reason={entry.block_reason}
                           review_approved={entry.review_approved}
                         />
                         <.pause_action
@@ -326,7 +327,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <td>
                       <div class="issue-stack">
                         <.issue_identifier identifier={entry.issue_identifier} url={entry.issue_url} />
-                        <.analysis_doc_link identifier={entry.issue_identifier} />
+                        <.artifact_links artifacts={entry.artifacts} />
                         <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON 详情</a>
                       </div>
                     </td>
@@ -403,7 +404,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <td>
                       <div class="issue-stack">
                         <.issue_identifier identifier={entry.issue_identifier} url={entry.issue_url} />
-                        <.analysis_doc_link identifier={entry.issue_identifier} />
+                        <.artifact_links artifacts={entry.artifacts} />
                         <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON 详情</a>
                       </div>
                     </td>
@@ -518,21 +519,20 @@ defmodule SymphonyElixirWeb.DashboardLive do
     """
   end
 
-  attr(:identifier, :string, required: true)
+  attr(:artifacts, :list, default: [])
 
-  # Analysis documents live in the source repository's shared ai-workspace.
-  defp analysis_doc_link(assigns) do
-    assigns = assign(assigns, :exists, AnalysisDocController.doc_exists?(assigns.identifier))
-
+  # Every published deliverable stays reachable from the row, whichever gate the
+  # item is at: reviewing an implementation means reading it against the analysis
+  # it was built from.
+  defp artifact_links(assigns) do
     ~H"""
-    <%= if @exists do %>
-      <a
-        class="issue-link doc-link"
-        href={AnalysisDocController.doc_path(@identifier)}
-        target="_blank"
-        rel="noopener noreferrer"
-      >系分文档 ↗</a>
-    <% end %>
+    <a
+      :for={artifact <- @artifacts}
+      class="issue-link doc-link"
+      href={artifact.path}
+      target="_blank"
+      rel="noopener noreferrer"
+    ><%= artifact_phase_label(artifact.phase) %> ↗</a>
     """
   end
 
@@ -552,7 +552,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
     assigns =
       assigns
-      |> assign(:label, advance_label(decision))
+      |> assign(:label, advance_label(decision, assigns.block_reason))
       |> assign(:class, advance_class(decision))
       |> assign(:confirm, advance_confirm(decision, assigns.identifier))
 
@@ -604,9 +604,27 @@ defmodule SymphonyElixirWeb.DashboardLive do
       assigns
       |> assign(:feedback, Map.get(assigns.entry, :feedback, []))
       |> assign(:review_approved, Map.get(assigns.entry, :review_approved, false))
+      |> assign(:artifact, Map.get(assigns.entry, :artifact))
 
     ~H"""
     <div class="action-stack">
+      <%= if @artifact do %>
+        <a
+          class="artifact-card"
+          href={@artifact.path}
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          <span class="artifact-title"><%= @artifact.title %></span>
+          <span class="artifact-meta mono numeric">
+            <%= artifact_phase_label(@artifact.phase) %> · <%= format_bytes(@artifact.bytes) %> · <%= @artifact.published_at %>
+          </span>
+          <span class="artifact-cue">点开查看这一关的产物 ↗</span>
+        </a>
+      <% else %>
+        <p class="artifact-missing">这一轮没有产出可确认的产物。写意见让它重跑，或点按钮继续推进。</p>
+      <% end %>
+
       <.advance_action
         issue_id={@entry.issue_id}
         identifier={@entry.issue_identifier}
@@ -750,7 +768,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
       String.contains?(normalized, ["blocked", "error", "failed"]) ->
         "#{base} state-badge-danger"
 
-      String.contains?(normalized, ["todo", "queued", "pending", "retry", "waiting", "paused"]) ->
+      String.contains?(normalized, ["todo", "queued", "pending", "retry", "waiting", "paused", "missing"]) ->
         "#{base} state-badge-warning"
 
       true ->
@@ -771,12 +789,19 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp runtime_status_label("paused"), do: "已暂停"
   defp runtime_status_label("review"), do: "待人工 Review"
   defp runtime_status_label("merge_pending"), do: "总结已出，待合并"
+  defp runtime_status_label("summary_missing"), do: "总结未产出"
   defp runtime_status_label("queued"), do: "排队中"
   defp runtime_status_label(_status), do: "等待调度"
 
   # The label has to name the decision, not the mechanism: an operator pressing
   # this needs to know whether they are spending tokens, approving a plan, or
   # ending the ticket.
+  # A redispatch after a phase delivered nothing is a re-run of that phase, and
+  # saying so beats "继续推进" — the operator is deciding whether to spend another
+  # run on the summary, not nudging a stalled ticket.
+  defp advance_label(:redispatch, :summary_incomplete), do: "重新生成 MR 总结"
+  defp advance_label(decision, _block_reason), do: advance_label(decision)
+
   defp advance_label(:start), do: "开始调度"
   defp advance_label(:resume), do: "恢复推进"
   defp advance_label(:approve_analysis), do: "批准继续"
@@ -814,6 +839,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp feedback_placeholder(:awaiting_merge, _review_approved),
     do: "写下 MR 总结需要改写的地方，Codex 会重新生成总结"
 
+  defp feedback_placeholder(:summary_incomplete, _review_approved),
+    do: "这一轮没有交出 MR 总结；写下要它补齐的内容，或直接点按钮让它重跑"
+
   defp feedback_placeholder(_block_reason, true),
     do: "写下 MR 总结需要改写的地方，Codex 会重新生成总结"
 
@@ -822,6 +850,17 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp feedback_placeholder(_block_reason, _review_approved),
     do: "写下需要 Codex 处理的内容，将随下一轮运行交给它"
+
+  defp artifact_phase_label("analysis"), do: "系分文档"
+  defp artifact_phase_label("implementation"), do: "实现与 CI"
+  defp artifact_phase_label("summary"), do: "MR 总结"
+  defp artifact_phase_label(phase), do: to_string(phase)
+
+  defp format_bytes(bytes) when is_integer(bytes) and bytes >= 1024,
+    do: "#{Float.round(bytes / 1024, 1)} KB"
+
+  defp format_bytes(bytes) when is_integer(bytes), do: "#{bytes} B"
+  defp format_bytes(_bytes), do: "暂无"
 
   defp feedback_phase_label("analysis"), do: "系分"
   defp feedback_phase_label("implementation"), do: "编码"

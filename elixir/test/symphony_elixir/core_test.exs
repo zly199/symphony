@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.CoreTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.{ApprovalStore, DispatchGate, OperatorFeedback}
+  alias SymphonyElixir.{ApprovalStore, Artifact, DispatchGate, OperatorFeedback}
 
   test "config defaults and validation checks" do
     write_workflow_file!(Workflow.workflow_file_path(),
@@ -1232,7 +1232,7 @@ defmodule SymphonyElixir.CoreTest do
     }
 
     refute ApprovalStore.approved?(issue_id)
-    write_analysis_doc!("MT-980")
+    write_analysis_doc!("issue-awaiting-approval", "MT-980")
     run_continuation_turn(pid, issue_id, issue)
 
     state = :sys.get_state(pid)
@@ -1242,7 +1242,7 @@ defmodule SymphonyElixir.CoreTest do
     assert error =~ "waiting for operator approval"
   end
 
-  test "a run that produced no analysis document is parked as incomplete" do
+  test "a run that published no analysis artifact is parked as incomplete" do
     issue_id = "issue-analysis-missing"
     orchestrator_name = Module.concat(__MODULE__, :AnalysisMissingOrchestrator)
     {:ok, pid} = start_continuation_orchestrator(orchestrator_name)
@@ -1254,24 +1254,101 @@ defmodule SymphonyElixir.CoreTest do
       updated_at: ~U[2026-07-27 09:01:30Z]
     }
 
-    refute SymphonyElixir.AnalysisDoc.exists?("MT-983")
+    refute Artifact.exists?(issue_id, :analysis)
     run_continuation_turn(pid, issue_id, issue)
 
     assert %{block_reason: :analysis_incomplete, error: error} =
              :sys.get_state(pid).blocked[issue_id]
 
-    assert error =~ "without producing the analysis document"
+    assert error =~ "without publishing an analysis artifact"
   end
 
-  defp write_analysis_doc!(identifier) do
-    {:ok, file} = SymphonyElixir.AnalysisDoc.doc_file(identifier)
+  test "a summary run that published its description parks at the finish gate" do
+    issue_id = "issue-summary-published"
+    orchestrator_name = Module.concat(__MODULE__, :SummaryPublishedOrchestrator)
+    {:ok, pid} = start_continuation_orchestrator(orchestrator_name)
 
-    File.mkdir_p!(Path.dirname(file))
-    File.write!(file, "<h1>#{identifier}</h1>")
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-984",
+      state: "In Progress",
+      updated_at: ~U[2026-07-27 09:01:30Z]
+    }
 
-    on_exit(fn -> File.rm_rf(Path.dirname(file)) end)
+    approve_review!(issue_id, "MT-984")
+    write_summary_artifact!(issue_id, "MT-984")
+    run_continuation_turn(pid, issue_id, issue)
 
-    file
+    assert %{block_reason: :awaiting_merge, error: error} =
+             :sys.get_state(pid).blocked[issue_id]
+
+    assert error =~ "waiting for the operator to finish"
+    # The handoff tool normally records this gate; a run that published and then
+    # ended without calling it has to leave the same record behind.
+    assert DispatchGate.review?(issue_id)
+  end
+
+  test "a summary run that published nothing is parked as incomplete" do
+    issue_id = "issue-summary-missing"
+    orchestrator_name = Module.concat(__MODULE__, :SummaryMissingOrchestrator)
+    {:ok, pid} = start_continuation_orchestrator(orchestrator_name)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-985",
+      state: "In Progress",
+      updated_at: ~U[2026-07-27 09:01:30Z]
+    }
+
+    approve_review!(issue_id, "MT-985")
+    refute Artifact.exists?(issue_id, :summary)
+    run_continuation_turn(pid, issue_id, issue)
+
+    assert %{block_reason: :summary_incomplete, error: error} =
+             :sys.get_state(pid).blocked[issue_id]
+
+    assert error =~ "without publishing a merge-request summary artifact"
+    refute DispatchGate.review?(issue_id)
+    assert Orchestrator.advance_decision(:started, :summary_incomplete, true) == :redispatch
+  end
+
+  defp approve_review!(issue_id, identifier) do
+    {:ok, _record} = ApprovalStore.approve_review(issue_id, identifier: identifier)
+
+    on_exit(fn ->
+      _ = ApprovalStore.revoke(issue_id)
+      _ = DispatchGate.forget(issue_id)
+    end)
+
+    :ok
+  end
+
+  defp write_summary_artifact!(issue_id, identifier) do
+    {:ok, artifact} =
+      Artifact.put(issue_id, :summary, %{
+        identifier: identifier,
+        title: "#{identifier} MR 总结",
+        format: "markdown",
+        body: "## 1. 设计思想\n1. #{identifier}\n"
+      })
+
+    on_exit(fn -> Artifact.clear(issue_id) end)
+
+    artifact
+  end
+
+  defp write_analysis_doc!(issue_id, identifier) do
+    {:ok, artifact} =
+      Artifact.put(issue_id, :analysis, %{
+        identifier: identifier,
+        title: "#{identifier} 系分",
+        format: "html",
+        body: "<h1>#{identifier}</h1>"
+      })
+
+    on_exit(fn -> Artifact.clear(issue_id) end)
+
+    artifact
   end
 
   test "approving an issue releases its block and records the decision" do
@@ -1286,7 +1363,7 @@ defmodule SymphonyElixir.CoreTest do
       updated_at: ~U[2026-07-27 09:01:30Z]
     }
 
-    write_analysis_doc!("MT-981")
+    write_analysis_doc!("issue-approve-release", "MT-981")
     run_continuation_turn(pid, issue_id, issue)
     assert %{block_reason: :awaiting_analysis_approval} = :sys.get_state(pid).blocked[issue_id]
 
@@ -1316,7 +1393,7 @@ defmodule SymphonyElixir.CoreTest do
       updated_at: ~U[2026-07-27 09:01:30Z]
     }
 
-    write_analysis_doc!("MT-984")
+    write_analysis_doc!("issue-analysis-revision", "MT-984")
     run_continuation_turn(pid, issue_id, issue)
     assert %{block_reason: :awaiting_analysis_approval} = :sys.get_state(pid).blocked[issue_id]
 
@@ -1394,6 +1471,7 @@ defmodule SymphonyElixir.CoreTest do
     issue = %Issue{id: issue_id, identifier: "MT-991", state: "In Progress"}
 
     {:ok, _record} = ApprovalStore.approve_review(issue_id, identifier: "MT-991")
+    write_summary_artifact!(issue_id, "MT-991")
     {:ok, _record} = DispatchGate.handoff_for_review(issue_id, identifier: "MT-991")
 
     run_continuation_turn(pid, issue_id, issue)
@@ -1459,6 +1537,112 @@ defmodule SymphonyElixir.CoreTest do
     assert AgentRunner.phase_for(issue) == :summary
   end
 
+  test "a review gate parked before a restart is rebuilt on the next poll" do
+    issue_id = "43912757"
+    orchestrator_name = Module.concat(__MODULE__, :ReviewRebuildOrchestrator)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-REBUILD",
+      title: "Held for review",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-REBUILD"
+    }
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      active_states: ["In Progress"],
+      terminal_states: ["Done"]
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    on_exit(fn -> Application.delete_env(:symphony_elixir, :memory_tracker_issues) end)
+
+    # The agent handed off during a previous orchestrator lifetime; the gate file
+    # survived, the in-memory block did not.
+    {:ok, _record} = DispatchGate.handoff_for_review(issue_id, identifier: "MT-REBUILD")
+
+    {:ok, pid} = start_continuation_orchestrator(orchestrator_name)
+    Process.sleep(120)
+
+    assert %{block_reason: :awaiting_human_review, identifier: "MT-REBUILD", issue: %Issue{}} =
+             :sys.get_state(pid).blocked[issue_id]
+
+    # A review already signed off, with the summary published, means the summary is
+    # what is on screen, and the rebuilt block has to say so or the gate offers the
+    # wrong decision.
+    {:ok, _approval} = ApprovalStore.approve_review(issue_id, identifier: "MT-REBUILD")
+    write_summary_artifact!(issue_id, "MT-REBUILD")
+
+    :sys.replace_state(pid, fn state -> %{state | blocked: %{}} end)
+    send(pid, :tick)
+    Process.sleep(150)
+
+    assert %{block_reason: :awaiting_merge} = :sys.get_state(pid).blocked[issue_id]
+  end
+
+  test "artifacts are stored per phase, replaced on republish, and listed in phase order" do
+    issue_id = "issue-artifact-store"
+    on_exit(fn -> Artifact.clear(issue_id) end)
+
+    assert Artifact.list(issue_id) == []
+    refute Artifact.exists?(issue_id, :analysis)
+
+    {:ok, analysis} =
+      Artifact.put(issue_id, :analysis, %{identifier: "MT-ART", title: "系分", body: "第一版"})
+
+    assert analysis.phase == "analysis"
+    assert analysis.format == "markdown"
+    assert analysis.bytes == byte_size("第一版")
+
+    # A gate shows the current answer, not a pile of drafts.
+    {:ok, _second} = Artifact.put(issue_id, :analysis, %{title: "系分", body: "第二版"})
+    assert %{body: "第二版"} = Artifact.fetch(issue_id, :analysis)
+
+    {:ok, _summary} = Artifact.put(issue_id, :summary, %{title: "MR 总结", body: "总结"})
+    {:ok, _impl} = Artifact.put(issue_id, :implementation, %{title: "实现", body: "实现"})
+
+    assert ["analysis", "implementation", "summary"] =
+             issue_id |> Artifact.list() |> Enum.map(& &1.phase)
+
+    :ok = Artifact.clear(issue_id)
+    assert Artifact.list(issue_id) == []
+  end
+
+  test "artifacts reject what would leave a gate with nothing to read" do
+    issue_id = "issue-artifact-invalid"
+    on_exit(fn -> Artifact.clear(issue_id) end)
+
+    assert {:error, :empty_body} = Artifact.put(issue_id, :analysis, %{title: "空", body: "  "})
+    assert {:error, :empty_body} = Artifact.put(issue_id, :analysis, %{title: "空"})
+    assert {:error, :unknown_phase} = Artifact.put(issue_id, :review, %{title: "阶段", body: "x"})
+
+    assert {:error, :unknown_format} =
+             Artifact.put(issue_id, :analysis, %{title: "格式", body: "x", format: "pdf"})
+
+    assert {:error, :body_too_large} =
+             Artifact.put(issue_id, :analysis, %{title: "太大", body: String.duplicate("x", 4_000_001)})
+
+    refute Artifact.exists?(issue_id, :analysis)
+    assert is_nil(Artifact.fetch(issue_id, :analysis))
+    assert is_nil(Artifact.fetch(issue_id, "nonsense"))
+  end
+
+  # Ids come from the tracker, so one carrying path separators must not place a
+  # file outside the artifacts directory.
+  test "a traversing issue id is reduced to a safe storage key" do
+    issue_id = "../../escape"
+    on_exit(fn -> Artifact.clear(issue_id) end)
+
+    {:ok, _artifact} = Artifact.put(issue_id, :analysis, %{title: "逃逸", body: "内容"})
+
+    assert %{body: "内容"} = Artifact.fetch(issue_id, :analysis)
+
+    directory = Artifact.directory(issue_id)
+    assert String.starts_with?(directory, Path.join(SymphonyElixir.Config.state_dir(), "artifacts"))
+    refute String.contains?(directory, "..")
+  end
+
   test "the advance decision names what continuing does at each gate" do
     assert Orchestrator.advance_decision(:waiting, nil, false) == :start
     assert Orchestrator.advance_decision(:paused, :operator_paused, false) == :resume
@@ -1481,7 +1665,7 @@ defmodule SymphonyElixir.CoreTest do
       updated_at: ~U[2026-07-27 09:01:30Z]
     }
 
-    write_analysis_doc!("MT-986")
+    write_analysis_doc!("issue-analysis-revision-blank", "MT-986")
     run_continuation_turn(pid, issue_id, issue)
 
     assert {:error, :empty_note} =
@@ -1890,7 +2074,7 @@ defmodule SymphonyElixir.CoreTest do
       updated_at: ~U[2026-07-27 09:01:30Z]
     }
 
-    write_analysis_doc!("MT-982")
+    write_analysis_doc!("issue-approval-not-idle", "MT-982")
     run_continuation_turn(pid, issue_id, issue)
     blocked = :sys.get_state(pid).blocked[issue_id]
 
