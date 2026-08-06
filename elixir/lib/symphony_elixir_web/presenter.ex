@@ -6,6 +6,7 @@ defmodule SymphonyElixirWeb.Presenter do
   alias SymphonyElixir.{
     ApprovalStore,
     Artifact,
+    CodexTranscript,
     Config,
     DispatchGate,
     OperatorFeedback,
@@ -106,7 +107,9 @@ defmodule SymphonyElixirWeb.Presenter do
       retry: retry && retry_issue_payload(retry),
       blocked: blocked && blocked_issue_payload(blocked),
       logs: %{
-        codex_session_logs: []
+        codex_session_logs:
+          issue_id_from_entries(running, retry, blocked)
+          |> transcript_runs_payload()
       },
       recent_events: recent_events_payload(running || blocked),
       last_error: (blocked && blocked.error) || (retry && retry.error),
@@ -141,6 +144,7 @@ defmodule SymphonyElixirWeb.Presenter do
       # A run in flight has whatever earlier phases published, which is what makes
       # the approved analysis readable while the implementation is still running.
       artifacts: entry.issue_id |> Artifact.list() |> Enum.map(&artifact_payload/1),
+      transcript: transcript_payload(entry.issue_id),
       started_at: iso8601(entry.started_at),
       last_event_at: iso8601(entry.last_codex_timestamp),
       tokens: %{
@@ -184,6 +188,7 @@ defmodule SymphonyElixirWeb.Presenter do
       gate_phase: gate_phase,
       artifact: artifact_payload(Artifact.fetch(entry.issue_id, gate_phase)),
       artifacts: entry.issue_id |> Artifact.list() |> Enum.map(&artifact_payload/1),
+      transcript: transcript_payload(entry.issue_id),
       feedback: feedback_payload(entry.issue_id),
       worker_host: Map.get(entry, :worker_host),
       workspace_path: Map.get(entry, :workspace_path),
@@ -216,6 +221,38 @@ defmodule SymphonyElixirWeb.Presenter do
 
   # Only the metadata travels in the payload: the body can be a whole analysis
   # document, and this payload is rebuilt on every dashboard tick.
+  # The transcript is what an operator falls back to when the gate has no artifact
+  # to show, so the link only claims to exist once a run has actually recorded one.
+  defp transcript_payload(issue_id) when is_binary(issue_id) do
+    case CodexTranscript.runs(issue_id) do
+      [] ->
+        nil
+
+      [latest | _rest] = runs ->
+        %{
+          path: "/transcripts/#{URI.encode(issue_id)}",
+          runs: length(runs),
+          bytes: latest.bytes,
+          recorded_at: latest.recorded_at
+        }
+    end
+  end
+
+  defp transcript_payload(_issue_id), do: nil
+
+  defp transcript_runs_payload(issue_id) when is_binary(issue_id) do
+    Enum.map(CodexTranscript.runs(issue_id), fn run ->
+      %{
+        run: run.name,
+        bytes: run.bytes,
+        recorded_at: run.recorded_at,
+        path: "/transcripts/#{URI.encode(issue_id)}?run=#{URI.encode(run.name)}"
+      }
+    end)
+  end
+
+  defp transcript_runs_payload(_issue_id), do: []
+
   defp artifact_payload(nil), do: nil
 
   defp artifact_payload(artifact) do

@@ -25,6 +25,13 @@ defmodule SymphonyElixir.StatusDashboard do
   @running_event_min_width 12
   @running_row_chrome_width 10
   @default_terminal_columns 115
+  # How much of an event's summary survives. The terminal clips again to its own
+  # column width, and the web dashboard puts the whole thing in the row's tooltip,
+  # so this is what an operator can actually read back — short enough to stay one
+  # line, long enough to carry the sentence the agent ended on.
+  @codex_message_length 400
+  # What an item's own content contributes to that line.
+  @item_content_length 320
 
   @ansi_reset IO.ANSI.reset()
   @ansi_bold IO.ANSI.bright()
@@ -1076,21 +1083,21 @@ defmodule SymphonyElixir.StatusDashboard do
     payload = unwrap_codex_message_payload(message)
 
     (humanize_codex_event(event, message, payload) || humanize_codex_payload(payload))
-    |> truncate(140)
+    |> truncate(@codex_message_length)
   end
 
   def humanize_codex_message(%{message: message}) do
     message
     |> unwrap_codex_message_payload()
     |> humanize_codex_payload()
-    |> truncate(140)
+    |> truncate(@codex_message_length)
   end
 
   def humanize_codex_message(message) do
     message
     |> unwrap_codex_message_payload()
     |> humanize_codex_payload()
-    |> truncate(140)
+    |> truncate(@codex_message_length)
   end
 
   defp summarize_message(message), do: humanize_codex_message(message)
@@ -1437,7 +1444,99 @@ defmodule SymphonyElixir.StatusDashboard do
       |> append_if_present(humanize_status(item_status))
 
     detail_suffix = if details == [], do: "", else: " (#{Enum.join(details, ", ")})"
-    "item #{state}: #{item_type}#{detail_suffix}"
+    headline = "item #{state}: #{item_type}#{detail_suffix}"
+
+    # "item completed: agent message" is the shape of the event, not its content,
+    # and an operator asking why a run produced nothing needs the content: what the
+    # agent actually said, what it reasoned, which command failed. The payload
+    # carries all of it, so it travels with the summary instead of being dropped.
+    case item_content(item) do
+      nil -> headline
+      content -> "#{headline} — #{content}"
+    end
+  end
+
+  defp item_content(item) when is_map(item) do
+    value =
+      map_value(item, ["text", :text]) ||
+        map_value(item, ["message", :message]) ||
+        reasoning_item_text(item) ||
+        command_item_text(item) ||
+        file_change_item_text(item)
+
+    case value do
+      text when is_binary(text) ->
+        case inline_text(text, @item_content_length) do
+          "" -> nil
+          trimmed -> trimmed
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp item_content(_item), do: nil
+
+  defp reasoning_item_text(item) do
+    case map_value(item, ["summary", :summary]) do
+      summary when is_binary(summary) ->
+        summary
+
+      parts when is_list(parts) ->
+        parts
+        |> Enum.map(fn
+          part when is_binary(part) -> part
+          part when is_map(part) -> map_value(part, ["text", :text])
+          _ -> nil
+        end)
+        |> Enum.reject(&is_nil/1)
+        |> Enum.join(" ")
+        |> case do
+          "" -> nil
+          joined -> joined
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  # A failing command is the single most common reason a phase ends with nothing
+  # published, so its exit code travels with it.
+  defp command_item_text(item) do
+    command = map_value(item, ["command", :command, "parsedCmd", :parsedCmd])
+
+    case normalize_command(command) do
+      nil ->
+        nil
+
+      command_text ->
+        case map_value(item, ["exitCode", :exitCode, "exit_code", :exit_code]) do
+          exit_code when is_integer(exit_code) -> "#{command_text} → exit #{exit_code}"
+          _ -> command_text
+        end
+    end
+  end
+
+  defp file_change_item_text(item) do
+    case map_value(item, ["changes", :changes]) do
+      changes when is_list(changes) and changes != [] ->
+        changes
+        |> Enum.map(fn
+          change when is_map(change) -> map_value(change, ["path", :path])
+          _change -> nil
+        end)
+        |> Enum.reject(&is_nil/1)
+        |> Enum.join(", ")
+        |> case do
+          "" -> "#{length(changes)} files"
+          paths -> paths
+        end
+
+      _ ->
+        nil
+    end
   end
 
   defp humanize_codex_wrapper_event("mcp_startup_update", payload) do
@@ -1773,15 +1872,17 @@ defmodule SymphonyElixir.StatusDashboard do
       map_path(payload, [:params, :msg, :payload, :type])
   end
 
-  defp inline_text(text) when is_binary(text) do
+  defp inline_text(text, max \\ 80)
+
+  defp inline_text(text, max) when is_binary(text) do
     text
     |> String.replace("\n", " ")
     |> String.replace(~r/\s+/, " ")
     |> String.trim()
-    |> truncate(80)
+    |> truncate(max)
   end
 
-  defp inline_text(other), do: other |> to_string() |> inline_text()
+  defp inline_text(other, max), do: other |> to_string() |> inline_text(max)
 
   defp parse_integer(value) when is_integer(value), do: value
 

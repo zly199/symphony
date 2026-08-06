@@ -66,18 +66,59 @@ Your single deliverable is the system-analysis document, published as this phase
 Writing, editing, or refactoring product code in this phase is out of scope, even when the fix
 looks obvious.
 
-1. Fetch the issue and its comments, read the referenced code, and understand the real cause.
-2. Write the analysis with the repository's fixed 7 sections, as one self-contained HTML document.
-3. Audit it with the `system-analysis-review` skill before delivering. A failed audit means rewrite
-   and audit again.
-4. Publish it with `symphony_publish_artifact`, `format: "html"`, title
-   `{{ issue.identifier }} 系分`, and the whole document as the body. This is the deliverable —
-   the operator reads it on the dashboard, so it does not go into a file under the ticket and it is
-   not registered in any docs index.
-5. Finish with a short report naming the root cause and the proposed change, then stop. A human
-   reads the artifact on the Symphony dashboard and either approves it — the implementation phase
-   starts only after that approval — or sends it back with written corrections, which re-runs this
-   phase with those corrections in the prompt.
+The document answers the question the ticket asked. That is the whole job, and it is the part that
+goes wrong: a document can carry every required section, every diagram, and every code reference,
+and still never say **why the current code produces this result** — at which point it is the ticket
+restated at greater length, and the operator learns nothing by reading it.
+
+Different tickets ask different questions, so there is no single document shape. Pick the shape from
+the question before you write anything.
+
+1. Fetch the issue and its comments, read the referenced code, and **classify the ticket first**.
+   Three questions decide it: is the code already written by someone else and handed over as a
+   merge request, does something currently produce a wrong result, and does this ticket change code
+   to fix it?
+
+   - **Review 票** — the ticket carries a merge-request link and asks you to review someone else's
+     finished change.
+   - **需求票** — nothing is broken; the ticket adds or changes behavior.
+   - **Bug 票** — something produces a wrong result and this ticket fixes it.
+   - **调查票** — something is wrong or questioned, but this ticket only answers 为什么 / 影响多大 /
+     能不能这样做.
+
+   The template follows from the type, not the other way round. Each type has its own section set
+   in the `system-analysis-review` skill, and they are not interchangeable: a 调查票 forced into
+   修改方案 and 上线方案 fills them with hedging and leaves the answer nowhere, a Bug 票 split
+   across 业务分析/数据分析/系统分析 says the same thing four times and never states the cause, and
+   a Review 票 written as a 需求票 restates the author's own merge-request description and reviews
+   nothing. Declare the type in one line at the top of 目标 so the operator can challenge it.
+2. For a Bug 票 or a 调查票, trace the cause in the code until you can name the one place where
+   behavior first diverges from what the business needs. The chain from the user's trigger to the
+   user's wrong result must have no step where you can only say "然后就错了" — every link needs
+   代码位置, 该处的实际行为, and 为什么导致下一步. If the evidence does not reach a cause, say
+   exactly what is missing and how to get it, and mark the document 未定论; that is a real answer
+   and it will be accepted. A confident guess will not be. A 需求票 has no cause to trace — do not
+   invent one.
+3. For a **Review 票**, read the diff with `glab mr diff`, file by file, and run the `p3c-review`
+   skill against the merge request's branch. Every finding needs 文件:行, what the code does, **what
+   it will break**, and the concrete fix; 「写得不好」「建议优化」 is a preference, not a finding.
+   End on a verdict — 通过 / 有条件通过 / 打回. You are reviewing, not fixing: do not edit the code,
+   commit, push, comment on the merge request, approve it, or merge it. When the merge request is a
+   bug fix, say whether it addresses the actual cause or patches a downstream symptom.
+4. Write it as one self-contained HTML document, using that type's section set.
+5. Audit it with the `system-analysis-review` skill before delivering. A failed audit means rewrite
+   and audit again. The skill's 票型与模板, 根因 and Review checks run first, and they are the ones
+   this phase fails on — read them before you draft, not after.
+6. Publish it with `symphony_publish_artifact`, `format: "html"`, and the whole document as the
+   body. Title it `{{ issue.identifier }} 系分`, or `{{ issue.identifier }} Review` for a Review 票.
+   This is the deliverable — the operator reads it on the dashboard, so it does not go into a file
+   under the ticket and it is not registered in any docs index.
+7. Finish with a short report: the ticket type, and then the root cause and proposed change for a
+   Bug 票, the proposed change for a 需求票, the answer to the question asked for a 调查票, or the
+   verdict and its blocking findings for a Review 票. Then stop. A human reads the artifact on the
+   Symphony dashboard and either approves it — the implementation phase starts only after that
+   approval — or sends it back with written corrections, which re-runs this phase with those
+   corrections in the prompt.
 
 Do not implement, do not add `ai-workspace` to Git, do not commit or push, do not open a merge
 request, and do not ask to continue. Ending your turn is how you hand control back.
@@ -111,6 +152,16 @@ approach.
 
 When implementation reveals the plan was wrong, publish a corrected analysis artifact with
 `symphony_publish_artifact` and say so in your report.
+
+Two approved analyses leave nothing to implement, and inventing work is the wrong move in both:
+
+- an investigation that concluded no change is needed
+- a review of someone else's merge request, whose findings are the author's to act on, not yours
+
+In either case publish this phase's artifact restating the conclusion or the verdict and the
+evidence behind it, say plainly that no change was made and why, and stop. Do not touch the
+reviewed merge request's code, branch, or approval state. The operator closes the ticket from the
+dashboard.
 
 This phase's own artifact is the review packet the operator reads before approving the change.
 Publish it with `symphony_publish_artifact` right before the handoff, in Chinese, containing:
@@ -268,24 +319,32 @@ Execution workflow:
    `origin/master` when the script reports `created:`. Example:
    `feat/KYUYO_NEW-4658-【backend】【Customer環境】給与計算エラー`.
 {% if phase == "analysis" %}
-4. Read the ticket, its comments, the referenced code, and any design material until you can name
-   the concrete cause and the concrete change, both grounded in file paths and identifiers.
-5. Write the analysis as one self-contained HTML document with the fixed 7 sections.
-6. Audit it with the `system-analysis-review` skill. Rewrite and re-audit until it passes; an
+4. Classify the ticket — Review 票 / 需求票 / Bug 票 / 调查票 — from whether the code is already
+   written and handed over as a merge request, what the ticket asks, and whether this ticket
+   changes code. The type decides the section set; declare it at the top of 目标.
+5. Read the ticket, its comments, the referenced code, and any design material until you can name
+   what the type requires, grounded in file paths and identifiers: for a Bug 票 the concrete cause
+   and the concrete change, for a 需求票 the concrete change, for a 调查票 the answer and the
+   evidence behind it, for a Review 票 the verdict and every finding with the consequence it
+   carries — read the diff with `glab mr diff` and run the `p3c-review` skill against the merge
+   request's branch, and change nothing.
+6. Write the analysis as one self-contained HTML document using that type's section set.
+7. Audit it with the `system-analysis-review` skill. Rewrite and re-audit until it passes; an
    unaudited document is not deliverable.
-7. Publish it with `symphony_publish_artifact`:
+8. Publish it with `symphony_publish_artifact`:
 
    ```json
    {"title": "{{ issue.identifier }} 系分", "format": "html", "body": "<the whole document>"}
    ```
 
-   Nothing is written under `ai-workspace/docs/tickets/` and nothing is registered in
-   `ai-workspace/docs/index.html`; the artifact is the deliverable.
-8. Report the root cause and the proposed change, then end your turn. Do not open a merge request
-   and do not start implementation. A human then either approves on the Symphony dashboard, and
-   Symphony re-dispatches this ticket in the implementation phase, or rejects it with corrections,
-   and Symphony re-dispatches this ticket in the analysis phase with those corrections listed
-   above.
+   Use `{{ issue.identifier }} Review` as the title for a Review 票. Nothing is written under
+   `ai-workspace/docs/tickets/` and nothing is registered in `ai-workspace/docs/index.html`; the
+   artifact is the deliverable.
+9. Report the ticket type and what that type owes — cause and change, change, answer, or verdict —
+   then end your turn. Do not open a merge request and do not start implementation. A human then
+   either approves on the Symphony dashboard, and Symphony re-dispatches this ticket in the
+   implementation phase, or rejects it with corrections, and Symphony re-dispatches this ticket in
+   the analysis phase with those corrections listed above.
 {% elsif phase == "summary" %}
 4. Confirm the ticket branch is checked out, carries its single commit, and has an open merge
    request. Read the merge request and its URL:

@@ -1840,6 +1840,73 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert StatusDashboard.humanize_codex_message(fallback_reasoning) == "reasoning update"
   end
 
+  # "item completed: agent message" is the shape of the event, not its content,
+  # and the content is what an operator needs when a phase produced nothing.
+  test "status dashboard carries a completed item's own content into the summary" do
+    agent_message = %{
+      event: :notification,
+      message: %{
+        "method" => "item/completed",
+        "params" => %{
+          "item" => %{
+            "id" => "item_7",
+            "type" => "agentMessage",
+            "status" => "completed",
+            "text" => "系分已经写完，但我没有调用 symphony_publish_artifact"
+          }
+        }
+      }
+    }
+
+    reasoning = %{
+      event: :notification,
+      message: %{
+        "method" => "item/completed",
+        "params" => %{
+          "item" => %{
+            "type" => "reasoning",
+            "summary" => [%{"text" => "先确认版本比较的分支"}, %{"text" => "再决定改哪一层"}]
+          }
+        }
+      }
+    }
+
+    failed_command = %{
+      event: :notification,
+      message: %{
+        "method" => "item/completed",
+        "params" => %{
+          "item" => %{"type" => "commandExecution", "command" => "mvn -q test", "exitCode" => 1}
+        }
+      }
+    }
+
+    file_change = %{
+      event: :notification,
+      message: %{
+        "method" => "item/completed",
+        "params" => %{
+          "item" => %{"type" => "fileChange", "changes" => [%{"path" => "src/Main.java"}]}
+        }
+      }
+    }
+
+    assert StatusDashboard.humanize_codex_message(agent_message) =~
+             "系分已经写完，但我没有调用 symphony_publish_artifact"
+
+    assert StatusDashboard.humanize_codex_message(reasoning) =~ "先确认版本比较的分支 再决定改哪一层"
+    assert StatusDashboard.humanize_codex_message(failed_command) =~ "mvn -q test → exit 1"
+    assert StatusDashboard.humanize_codex_message(file_change) =~ "src/Main.java"
+
+    # An item with nothing to say still reads as it did before.
+    plain = %{
+      event: :notification,
+      message: %{"method" => "item/completed", "params" => %{"item" => %{"type" => "todoList"}}}
+    }
+
+    assert StatusDashboard.humanize_codex_message(plain) == "item completed: todo list"
+  end
+
   test "application stop renders offline status" do
     rendered =
       ExUnit.CaptureIO.capture_io(fn ->

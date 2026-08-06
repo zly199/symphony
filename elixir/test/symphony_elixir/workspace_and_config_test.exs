@@ -1903,6 +1903,35 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Config.workflow_prompt() == workflow_prompt
   end
 
+  # The prompt is split into lines and rejoined on the way in. Splitting on `\R`
+  # did that byte-wise, and NEL — the single byte 0x85 — is one of the newlines it
+  # accepts, which is also the third byte of `际` (E9 99 85) and many other CJK
+  # characters. The rejoin then left an LF inside the character, and the prompt
+  # that reached Codex was no longer valid UTF-8: `Jason.encode!` refused it and
+  # the run died before its first turn.
+  test "workflow prompt survives CJK characters whose bytes contain a newline byte" do
+    workflow_prompt = "追踪实际行为：该处的实际行为, 为什么导致下一步。\n第二行也要保留。"
+
+    write_workflow_file!(Workflow.workflow_file_path(), prompt: workflow_prompt)
+
+    loaded = Config.workflow_prompt()
+
+    assert String.valid?(loaded)
+    assert loaded == workflow_prompt
+    assert String.contains?(loaded, "实际行为")
+
+    # The same corruption reached the built prompt, which is what actually broke.
+    {:ok, %{prompt_template: template}} = Workflow.current()
+    assert String.valid?(template)
+    assert String.contains?(template, "该处的实际行为")
+  end
+
+  test "workflow prompt keeps its line structure across CRLF and CR endings" do
+    write_workflow_file!(Workflow.workflow_file_path(), prompt: "first\r\nsecond\rthird\nfourth")
+
+    assert Config.workflow_prompt() == "first\nsecond\nthird\nfourth"
+  end
+
   test "remote workspace lifecycle uses ssh host aliases from worker config" do
     test_root =
       Path.join(

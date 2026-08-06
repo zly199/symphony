@@ -6,6 +6,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
   alias SymphonyElixir.ApprovalStore
   alias SymphonyElixir.Artifact
+  alias SymphonyElixir.CodexTranscript
   alias SymphonyElixir.OperatorFeedback
   alias SymphonyElixir.DispatchGate
   alias SymphonyElixir.Linear.Adapter
@@ -349,6 +350,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                    %{"at" => nil, "event" => "notification", "message" => "rendered"}
                  ],
                  "artifacts" => [],
+                 "transcript" => nil,
                  "started_at" => state_payload["running"] |> List.first() |> Map.fetch!("started_at"),
                  "last_event_at" => nil,
                  "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
@@ -379,6 +381,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "gate_phase" => "analysis",
                  "artifact" => nil,
                  "artifacts" => [],
+                 "transcript" => nil,
                  "feedback" => [],
                  "worker_host" => "dm-dev2",
                  "workspace_path" => "/workspaces/MT-BLOCKED",
@@ -1110,6 +1113,100 @@ defmodule SymphonyElixir.ExtensionsTest do
     # artifacts directory.
     test "a traversing issue id cannot read another file" do
       assert response(get(build_conn(), "/artifacts/..%2F..%2Fapprovals/analysis"), 404)
+    end
+  end
+
+  describe "transcript route" do
+    setup do
+      start_test_endpoint([])
+      on_exit(fn -> CodexTranscript.clear("issue-transcript") end)
+      :ok
+    end
+
+    defp record_run(issue_id, events) do
+      handle = CodexTranscript.start_run(issue_id, identifier: "MT-LOG", phase: :analysis)
+      Enum.each(events, &CodexTranscript.record(handle, &1))
+      CodexTranscript.finish(handle, :ok)
+      handle
+    end
+
+    test "renders the agent's own words, its reasoning, and how commands exited" do
+      record_run("issue-transcript", [
+        %{
+          event: :notification,
+          timestamp: ~U[2026-08-06 00:00:01Z],
+          payload: %{
+            "method" => "item/completed",
+            "params" => %{"item" => %{"type" => "agentMessage", "text" => "我没有产出产物，因为审计没过"}}
+          }
+        },
+        %{
+          event: :notification,
+          timestamp: ~U[2026-08-06 00:00:02Z],
+          payload: %{
+            "method" => "item/completed",
+            "params" => %{"item" => %{"type" => "reasoning", "summary" => [%{"text" => "先复核版本比较"}]}}
+          }
+        },
+        %{
+          event: :notification,
+          timestamp: ~U[2026-08-06 00:00:03Z],
+          payload: %{
+            "method" => "item/completed",
+            "params" => %{"item" => %{"type" => "commandExecution", "command" => "mvn -q test", "exitCode" => 1}}
+          }
+        },
+        # Bookkeeping stays out of a page meant to be read start to finish.
+        %{
+          event: :notification,
+          timestamp: ~U[2026-08-06 00:00:04Z],
+          payload: %{"method" => "thread/tokenUsage/updated", "params" => %{}}
+        }
+      ])
+
+      body = response(get(build_conn(), "/transcripts/issue-transcript"), 200)
+
+      assert body =~ "我没有产出产物，因为审计没过"
+      assert body =~ "先复核版本比较"
+      assert body =~ "mvn -q test"
+      assert body =~ "exit 1"
+      refute body =~ "thread/tokenUsage/updated"
+    end
+
+    test "escapes an agent message rather than rendering it" do
+      record_run("issue-transcript", [
+        %{
+          event: :notification,
+          timestamp: ~U[2026-08-06 00:00:01Z],
+          payload: %{
+            "method" => "item/completed",
+            "params" => %{"item" => %{"type" => "agentMessage", "text" => "<script>alert(1)</script>"}}
+          }
+        }
+      ])
+
+      body = response(get(build_conn(), "/transcripts/issue-transcript"), 200)
+
+      assert body =~ "&lt;script&gt;"
+      refute body =~ "<script>alert(1)</script>"
+    end
+
+    test "serves the raw jsonl for grepping" do
+      record_run("issue-transcript", [
+        %{event: :notification, timestamp: ~U[2026-08-06 00:00:01Z], payload: %{"method" => "turn/completed"}}
+      ])
+
+      conn = get(build_conn(), "/transcripts/issue-transcript?format=raw")
+
+      assert response(conn, 200) =~ ~s("method":"turn/completed")
+      assert response_content_type(conn, :text) =~ "text/plain"
+    end
+
+    test "an issue with no recorded run, and a run name that was never recorded, are 404" do
+      record_run("issue-transcript", [])
+
+      assert response(get(build_conn(), "/transcripts/issue-never-ran"), 404)
+      assert response(get(build_conn(), "/transcripts/issue-transcript?run=..%2F..%2Fapprovals.json"), 404)
     end
   end
 end

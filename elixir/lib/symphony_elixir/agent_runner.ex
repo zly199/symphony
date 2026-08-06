@@ -8,6 +8,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   alias SymphonyElixir.{
     ApprovalStore,
+    CodexTranscript,
     Config,
     DispatchGate,
     OperatorFeedback,
@@ -74,8 +75,13 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp codex_message_handler(recipient, issue) do
+  # The orchestrator keeps a short ring of one-line summaries; the transcript keeps
+  # everything. Recording happens here rather than in the orchestrator because this
+  # runs in the issue's own task, so one talkative agent cannot slow the loop that
+  # dispatches every other ticket.
+  defp codex_message_handler(recipient, issue, transcript) do
     fn message ->
+      CodexTranscript.record(transcript, message)
       send_codex_update(recipient, issue, message)
     end
   end
@@ -118,17 +124,37 @@ defmodule SymphonyElixir.AgentRunner do
 
     Logger.info("Running #{issue_context(issue)} in #{phase} phase with max_turns=#{max_turns}")
 
-    with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
-      # The feedback is already in this run's opening prompt, so the session
-      # starting is the point where it counts as answered by a run.
-      mark_review_feedback_delivered(issue)
+    transcript =
+      CodexTranscript.start_run(Map.get(issue, :id),
+        identifier: Map.get(issue, :identifier),
+        phase: phase,
+        workspace: workspace,
+        worker_host: worker_host
+      )
 
+    opts = Keyword.put(opts, :transcript, transcript)
+
+    result =
       try do
-        do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
-      after
-        AppServer.stop_session(session)
+        with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
+          # The feedback is already in this run's opening prompt, so the session
+          # starting is the point where it counts as answered by a run.
+          mark_review_feedback_delivered(issue)
+
+          try do
+            do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+          after
+            AppServer.stop_session(session)
+          end
+        end
+      catch
+        kind, reason ->
+          CodexTranscript.finish(transcript, {kind, reason})
+          :erlang.raise(kind, reason, __STACKTRACE__)
       end
-    end
+
+    CodexTranscript.finish(transcript, result)
+    result
   end
 
   defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
@@ -139,7 +165,12 @@ defmodule SymphonyElixir.AgentRunner do
              app_session,
              prompt,
              issue,
-             on_message: codex_message_handler(codex_update_recipient, issue)
+             on_message:
+               codex_message_handler(
+                 codex_update_recipient,
+                 issue,
+                 Keyword.get(opts, :transcript, %{path: nil, device: nil, bytes: nil})
+               )
            ) do
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 

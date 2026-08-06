@@ -82,8 +82,16 @@ defmodule SymphonyElixir.Workflow do
     end
   end
 
+  # Split on real line terminators only. `\R` looks like the right thing and is
+  # not: without the `u` modifier it runs byte-wise, and one of the newlines it
+  # accepts is NEL, the single byte 0x85 — which is also the third byte of plenty
+  # of CJK characters (`际` is E9 99 85). Splitting there cuts the character in
+  # half, the rejoin puts an LF in its place, and the prompt that reaches Codex is
+  # no longer valid UTF-8, so `Jason.encode!` refuses it and the run dies before
+  # the first turn. A Markdown file's lines end with LF, CRLF, or CR; nothing else
+  # here is a line break.
   defp split_front_matter(content) do
-    lines = String.split(content, ~r/\R/, trim: false)
+    lines = String.split(content, ~r/\r\n|\r|\n/, trim: false)
 
     case lines do
       ["---" | tail] ->

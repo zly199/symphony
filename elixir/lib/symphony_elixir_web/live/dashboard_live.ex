@@ -328,6 +328,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       <div class="issue-stack">
                         <.issue_identifier identifier={entry.issue_identifier} url={entry.issue_url} />
                         <.artifact_links artifacts={entry.artifacts} />
+                        <.transcript_link transcript={entry.transcript} />
                         <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON 详情</a>
                       </div>
                     </td>
@@ -405,6 +406,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       <div class="issue-stack">
                         <.issue_identifier identifier={entry.issue_identifier} url={entry.issue_url} />
                         <.artifact_links artifacts={entry.artifacts} />
+                        <.transcript_link transcript={entry.transcript} />
                         <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON 详情</a>
                       </div>
                     </td>
@@ -536,6 +538,24 @@ defmodule SymphonyElixirWeb.DashboardLive do
     """
   end
 
+  attr(:transcript, :map, default: nil)
+
+  # The published deliverables are what the agent chose to show. This is what it
+  # actually did — the link an operator needs precisely when there is no
+  # deliverable to explain the run.
+  defp transcript_link(assigns) do
+    ~H"""
+    <%= if @transcript do %>
+      <a
+        class="issue-link doc-link"
+        href={@transcript.path}
+        target="_blank"
+        rel="noopener noreferrer"
+      >运行记录 ↗</a>
+    <% end %>
+    """
+  end
+
   attr(:issue_id, :string, required: true)
   attr(:identifier, :string, required: true)
   attr(:run_status, :atom, default: :waiting)
@@ -605,6 +625,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
       |> assign(:feedback, Map.get(assigns.entry, :feedback, []))
       |> assign(:review_approved, Map.get(assigns.entry, :review_approved, false))
       |> assign(:artifact, Map.get(assigns.entry, :artifact))
+      |> assign(:transcript, Map.get(assigns.entry, :transcript))
 
     ~H"""
     <div class="action-stack">
@@ -622,7 +643,19 @@ defmodule SymphonyElixirWeb.DashboardLive do
           <span class="artifact-cue">点开查看这一关的产物 ↗</span>
         </a>
       <% else %>
-        <p class="artifact-missing">这一轮没有产出可确认的产物。写意见让它重跑，或点按钮继续推进。</p>
+        <p class="artifact-missing">这一轮没有产出可确认的产物。先看运行记录确认它到底做了什么，再写意见让它重跑，或点按钮继续推进。</p>
+      <% end %>
+
+      <%= if @transcript do %>
+        <a
+          class="transcript-link"
+          href={@transcript.path}
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          运行记录：最后一次对话与思考过程 ↗
+          <span class="muted mono numeric"><%= @transcript.runs %> 次运行 · <%= format_bytes(@transcript.bytes) %></span>
+        </a>
       <% end %>
 
       <.advance_action

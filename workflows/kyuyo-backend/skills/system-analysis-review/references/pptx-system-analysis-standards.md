@@ -33,6 +33,39 @@ Before accepting an analysis, build a source coverage map from every concrete re
 
 Every item from the source coverage map must be represented in the HTML in the right section, or explicitly marked out of scope with a reason. Any missing concrete item is a reject.
 
+## Ticket Types
+
+The source PPTX describes one kind of work: deciding what the system should become. That is a 需求票, and everything below about business modeling, application design, and data design is written for it. Three other kinds of ticket arrive at the same gate and need a different document:
+
+| 票型 | 问的问题 | 交付物 | 本文适用部分 |
+| --- | --- | --- | --- |
+| 需求票 | 要做成什么 | 变更方案 | 全部 |
+| Bug 票 | 为什么错，怎么修 | 根因 + 变更方案 | Root Cause + System Design + 验证 |
+| 调查票 | 为什么/影响多大/能不能 | 答案 | Root Cause + 验证 |
+| Review 票 | 别人写的这份改动行不行 | 结论 + 问题清单 | Design Quality Principles（作为评判标准） |
+
+Classify before drafting. The PPTX chain 业务需求 → 业务分析与建模 → 应用/数据设计 → 技术设计 → 系统方案 → 验证计划 is the 需求票 chain; a Bug 票 enters it only from 系统方案 onward, after the causal chain has established what is actually wrong; a 调查票 stops at the cause and its verification; a Review 票 runs the chain backwards, reading a finished change and asking whether each step of it holds up.
+
+For a Review 票, the Design Quality Principles below are the yardstick rather than the instructions: 局部化改动、关注点分离、模块边界（耦合/内聚/信息隐藏/作用域）、可维护性归属、方案取舍是否有理由. A finding is what happens when the change violates one of them *and* that violation has a concrete consequence.
+
+## Root Cause Requirements
+
+Applies to Bug 票 and 调查票 — every ticket that is not purely additive. The source PPTX does not cover it: it asks what the system should become, and these tickets ask the prior question, **why does the current code produce this result**.
+
+A root cause is a chain, not a label. Each link:
+
+| Element | Required Content |
+| --- | --- |
+| 代码位置 | file path plus class/method, or the config/data location |
+| 实际行为 | what that code does with the actual input, in concrete values where values matter |
+| 导致下一步的原因 | what that behavior makes the next link do |
+
+The chain runs unbroken from the user's trigger to the user's wrong result, and ends by naming one defective point: where behavior first diverges from what the business needs.
+
+These are not causes, and a document that offers one has restated the symptom: 「逻辑有误」「未考虑该场景」「存在缺陷」「数据不一致」「设计如此」.
+
+An investigation that cannot reach a cause is finished honestly by naming the missing evidence, how to obtain it, and marking itself 未定论.
+
 ## Business Analysis Requirements
 
 Business analysis must cover only business-language content. Do not put API paths, classes, services, methods, DTO names, file paths, storage operations, or code identifiers in business analysis; move them to data/system analysis.
@@ -126,6 +159,16 @@ Use diagrams as delivery artifacts, not decoration. Do not use tables; render ev
 
 A document must be rejected and rewritten when:
 
+- It uses the wrong template for the ticket type: a 调查票 carrying 修改方案/上线方案, a Bug 票 split across 业务分析/数据分析/系统分析 instead of one causal chain, a 需求票 carrying an invented 根因分析, or a merge-request handover written as a 需求票 instead of a Review 票. Wrong template is blocking before content is read.
+- It is a Review 票 whose 变更概览 could have been produced from the merge-request description without reading the diff, or whose findings say 「写得不好」「建议优化」 without naming what breaks.
+- It describes the current behavior without saying why the code produces it (Bug 票/调查票). This is the most common failure and outranks the rest: a document that reaches the end without a causal chain is the ticket restated, whatever else it covers.
+- Its causal chain has a gap — a step stating what happened but not why that made the next step happen.
+- It asserts a cause with no code location, or names a cause that is the symptom in other words.
+- It never names the single point where behavior first diverges from what the business needs.
+- It shows no 实际 vs 预期 flow comparison with the divergence marked.
+- It answers a question the ticket did not ask, while the one the ticket did ask has no direct answer anywhere in it.
+- It is an investigation ticket carrying 修改方案/上线方案 filled with hedging instead of the investigation section set.
+- It presents a guess as a conclusion where the evidence does not reach, instead of marking itself 未定论 and naming what would settle it.
 - It skips source coverage comparison between design docs, Backlog body/comments, linked tickets, chat-added requirements, code/tests/config, and the generated HTML.
 - It omits a concrete source requirement, field, event, validation, exception, data item, workflow step, dependency, open question, or acceptance point without marking it out of scope.
 - It only paraphrases the ticket and does not restore business behavior from evidence.

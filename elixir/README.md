@@ -397,6 +397,23 @@ The observability UI now runs on a minimal Phoenix stack:
 - Phoenix dependency static assets for the LiveView client bootstrap
 - Tracker issue identifiers link to the tracker-provided URL when it uses `http` or `https`
 
+### Run transcripts
+
+Every Codex message of a run is appended to `<state_dir>/transcripts/<issue_id>/<timestamp>.jsonl`,
+and the dashboard links it as 运行记录 on both the running and the blocked rows.
+
+The activity column is a 25-entry ring of one-liners, which is the right shape for watching a run
+and the wrong shape for explaining one. When a phase ends without publishing an artifact, the
+transcript is what says whether the agent answered in prose instead of calling
+`symphony_publish_artifact`, hit a failing command, or ran out of turns mid-thought.
+
+- `/transcripts/<issue_id>` renders the newest run: agent messages, reasoning, commands and their
+  exit codes, tool calls. Token and rate-limit bookkeeping is left out; unrecognised events are
+  still shown raw, so a new app-server message can never make a run look empty.
+- `/transcripts/<issue_id>?run=<name>` opens an earlier run; the 20 most recent are kept per issue.
+- `/transcripts/<issue_id>?run=<name>&format=raw` returns the JSONL itself for grepping.
+- `/api/v1/<issue_identifier>` lists every recorded run under `logs.codex_session_logs`.
+
 ## Project Layout
 
 - `lib/`: application code and Mix tasks

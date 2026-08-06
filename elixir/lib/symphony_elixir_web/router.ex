@@ -30,6 +30,7 @@ defmodule SymphonyElixirWeb.Router do
 
   scope "/", SymphonyElixirWeb do
     get("/artifacts/:issue_id/:phase", ArtifactController, :show)
+    get("/transcripts/:issue_id", TranscriptController, :show)
   end
 
   scope "/", SymphonyElixirWeb do
